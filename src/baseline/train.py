@@ -174,6 +174,7 @@ def train() -> None:
 
     # Evaluate the model
     val_preds = model.predict(X_val)
+    val_preds = val_preds.flatten() if hasattr(val_preds, 'flatten') else val_preds
     val_proba = model.predict_proba(X_val)  # Shape: (n_samples, 3) for 3 classes
 
     accuracy = accuracy_score(y_val, val_preds)
