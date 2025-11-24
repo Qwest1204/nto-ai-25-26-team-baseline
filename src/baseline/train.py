@@ -8,10 +8,10 @@ correct validation without data leakage from future timestamps.
 import json
 from pathlib import Path
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, precision_score, recall_score
+from catboost import CatBoostClassifier, Pool
 
 from . import config, constants
 from .evaluate import dcg_at_k, ndcg_at_k
@@ -115,6 +115,8 @@ def train() -> None:
     X_val = val_split_final[features].copy()
     y_val = val_split_final[config.TARGET]
 
+    print(y_val.head(5))
+
     # Optimize memory usage: convert float64 to float32 (reduces memory by ~50%)
     print("Optimizing data types for memory efficiency...")
     float64_cols = X_train.select_dtypes(include=["float64"]).columns
@@ -137,50 +139,19 @@ def train() -> None:
     # Ensure model directory exists
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Create checkpoint directory for intermediate model saves
-    checkpoint_dir = config.MODEL_DIR / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Checkpoint directory: {checkpoint_dir}")
-
     # Train model
-    print("\nTraining LightGBM model (multiclass classification: 3 classes)...")
+    print("\nTraining CatBoost model (multiclass classification: 3 classes)...")
     print("  Classes: 0=cold candidates, 1=planned books, 2=read books")
-    model = lgb.LGBMClassifier(**config.LGB_PARAMS)
+    model = CatBoostClassifier(**config.CATBOOST_PARAMS)
 
-    # Create callback for saving checkpoints every 50 iterations
-    def checkpoint_callback(env: lgb.callback.CallbackEnv) -> None:
-        """Save model checkpoint every 50 iterations."""
-        iteration = env.iteration
-        if iteration > 0 and iteration % 50 == 0:
-            checkpoint_path = checkpoint_dir / f"checkpoint_iter_{iteration}.txt"
-            # env.model is the Booster object during training
-            env.model.save_model(str(checkpoint_path))
-            print(f"  Checkpoint saved at iteration {iteration}: {checkpoint_path}")
-
-    # Update fit params with early stopping callback
-    fit_params = config.LGB_FIT_PARAMS.copy()
-    fit_params["callbacks"] = [
-        lgb.early_stopping(
-            stopping_rounds=config.EARLY_STOPPING_ROUNDS,
-            verbose=True,
-        ),
-        lgb.log_evaluation(period=1),
-        checkpoint_callback,
-    ]
-
-    # Explicitly specify categorical features to avoid LightGBM hanging
-    # Convert categorical feature names to column indices
-    categorical_feature_indices = [
-        features.index(f) for f in categorical_features if f in features
-    ]
+    train_pool = Pool(X_train, y_train, cat_features=categorical_features)
+    val_pool = Pool(X_val, y_val, cat_features=categorical_features)
 
     model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_val, y_val)],
-        eval_metric=fit_params["eval_metric"],
-        callbacks=fit_params["callbacks"],
-        categorical_feature=categorical_feature_indices if categorical_feature_indices else "auto",
+        train_pool,
+        eval_set=val_pool,
+        early_stopping_rounds=config.EARLY_STOPPING_ROUNDS,
+        verbose=True,
     )
 
     # Evaluate the model
@@ -208,7 +179,7 @@ def train() -> None:
 
     # Save the trained model
     model_path = config.MODEL_DIR / config.MODEL_FILENAME
-    model.booster_.save_model(str(model_path))
+    model.save_model(str(model_path))
     print(f"\nModel saved to {model_path}")
 
     # Save feature list for prediction
@@ -222,4 +193,3 @@ def train() -> None:
 
 if __name__ == "__main__":
     train()
-

@@ -96,3 +96,28 @@ LGB_FIT_PARAMS = {
     "callbacks": [],  # Placeholder for early stopping callback
 }
 
+CATBOOST_PARAMS = {
+    "loss_function": "MultiClass",
+    "eval_metric": "TotalF1",
+    "iterations": 3000,
+    "learning_rate": 0.03,
+    "depth": 4,
+    "l2_leaf_reg": 3.0,
+    "bagging_temperature": 1.0,
+    "random_strength": 1.0,
+    #"max_bin": 254,
+    "random_seed": RANDOM_STATE,
+    #"thread_count": -1,
+    #"verbose": 100,
+    #"early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+    "task_type": "GPU" if torch and torch.cuda.is_available() else "CPU",
+    "devices": "0" if torch and torch.cuda.is_available() else None,
+    # экономия памяти
+    #"used_ram_limit": "12gb",
+}
+
+# трейн конфиг
+CATBOOST_FIT_KWARGS = {
+    "use_best_model": True,
+    "plot": False,
+}
