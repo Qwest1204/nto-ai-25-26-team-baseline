@@ -115,8 +115,6 @@ def train() -> None:
     X_val = val_split_final[features].copy()
     y_val = val_split_final[config.TARGET]
 
-    print(y_val.head(5))
-
     # Optimize memory usage: convert float64 to float32 (reduces memory by ~50%)
     print("Optimizing data types for memory efficiency...")
     float64_cols = X_train.select_dtypes(include=["float64"]).columns
@@ -142,7 +140,12 @@ def train() -> None:
     # Train model
     print("\nTraining CatBoost model (multiclass classification: 3 classes)...")
     print("  Classes: 0=cold candidates, 1=planned books, 2=read books")
-    model = CatBoostClassifier(**config.CATBOOST_PARAMS)
+    params = config.CATBOOST_PARAMS.copy()
+    if 'num_class' in params:
+        del params['num_class']
+    if 'objective' in params:
+        params['loss_function'] = 'MultiClass'
+    model = CatBoostClassifier(**params)
 
     train_pool = Pool(X_train, y_train, cat_features=categorical_features)
     val_pool = Pool(X_val, y_val, cat_features=categorical_features)
@@ -155,7 +158,7 @@ def train() -> None:
     )
 
     # Evaluate the model
-    val_preds = model.predict(X_val)
+    val_preds = model.predict(X_val).ravel()
     val_proba = model.predict_proba(X_val)  # Shape: (n_samples, 3) for 3 classes
 
     accuracy = accuracy_score(y_val, val_preds)
@@ -172,7 +175,7 @@ def train() -> None:
     print(f"  Precision (weighted): {precision:.4f}")
     print(f"  Recall (weighted): {recall:.4f}")
     print(f"  Predicted class distribution:")
-    for class_idx in range(3):
+    for class_idx in range(val_proba.shape[1]):
         count = class_dist.get(class_idx, 0)
         proba_mean = class_proba_mean[class_idx]
         print(f"    Class {class_idx}: {count} samples ({100*count/len(val_preds):.1f}%), mean proba: {proba_mean:.4f}")
