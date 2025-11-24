@@ -1,5 +1,5 @@
 """
-Main training script for the LightGBM model.
+Main training script for the CatBoost model.
 
 Uses temporal split with absolute date threshold to ensure methodologically
 correct validation without data leakage from future timestamps.
@@ -8,7 +8,8 @@ correct validation without data leakage from future timestamps.
 import json
 from pathlib import Path
 
-import lightgbm as lgb
+from catboost import CatBoostClassifier, Pool
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, precision_score, recall_score
@@ -25,7 +26,7 @@ def train() -> None:
 
     Loads prepared data from data/processed/, performs temporal split based on
     absolute date threshold, computes aggregate features on train split only,
-    and trains a single LightGBM model for multiclass classification (relevance).
+    and trains a single CatBoost model for multiclass classification (relevance).
     Relevance classes: 0=cold candidates, 1=planned books, 2=read books.
     This ensures methodologically correct validation without data leakage from
     future timestamps.
@@ -124,7 +125,7 @@ def train() -> None:
         X_val[float64_cols] = X_val[float64_cols].astype("float32")
         print(f"  Memory saved: ~{X_train[float64_cols].memory_usage(deep=True).sum() / 1024**2 / 2:.1f} MB")
 
-    # Identify categorical features for LightGBM
+    # Identify categorical features
     categorical_features = [
         f for f in features if train_split_final[f].dtype.name == "category"
     ]
@@ -142,45 +143,33 @@ def train() -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoint directory: {checkpoint_dir}")
 
-    # Train model
-    print("\nTraining LightGBM model (multiclass classification: 3 classes)...")
+    # Train CatBoost model
+    print("\nTraining CatBoost model (multiclass classification: 3 classes)...")
     print("  Classes: 0=cold candidates, 1=planned books, 2=read books")
-    model = lgb.LGBMClassifier(**config.LGB_PARAMS)
 
-    # Create callback for saving checkpoints every 50 iterations
-    def checkpoint_callback(env: lgb.callback.CallbackEnv) -> None:
-        """Save model checkpoint every 50 iterations."""
-        iteration = env.iteration
-        if iteration > 0 and iteration % 50 == 0:
-            checkpoint_path = checkpoint_dir / f"checkpoint_iter_{iteration}.txt"
-            # env.model is the Booster object during training
-            env.model.save_model(str(checkpoint_path))
-            print(f"  Checkpoint saved at iteration {iteration}: {checkpoint_path}")
-
-    # Update fit params with early stopping callback
-    fit_params = config.LGB_FIT_PARAMS.copy()
-    fit_params["callbacks"] = [
-        lgb.early_stopping(
-            stopping_rounds=config.EARLY_STOPPING_ROUNDS,
-            verbose=True,
-        ),
-        lgb.log_evaluation(period=1),
-        checkpoint_callback,
-    ]
-
-    # Explicitly specify categorical features to avoid LightGBM hanging
-    # Convert categorical feature names to column indices
-    categorical_feature_indices = [
-        features.index(f) for f in categorical_features if f in features
-    ]
-
-    model.fit(
+    # Create CatBoost pools
+    train_pool = Pool(
         X_train,
         y_train,
-        eval_set=[(X_val, y_val)],
-        eval_metric=fit_params["eval_metric"],
-        callbacks=fit_params["callbacks"],
-        categorical_feature=categorical_feature_indices if categorical_feature_indices else "auto",
+        cat_features=categorical_features,
+        feature_names=features
+    )
+
+    val_pool = Pool(
+        X_val,
+        y_val,
+        cat_features=categorical_features,
+        feature_names=features
+    )
+
+    # Initialize CatBoost model
+    model = CatBoostClassifier(**config.CATBOOST_PARAMS)
+
+    # Train the model
+    model.fit(
+        train_pool,
+        eval_set=val_pool,
+        **config.CATBOOST_FIT_KWARGS
     )
 
     # Evaluate the model
@@ -207,8 +196,8 @@ def train() -> None:
         print(f"    Class {class_idx}: {count} samples ({100*count/len(val_preds):.1f}%), mean proba: {proba_mean:.4f}")
 
     # Save the trained model
-    model_path = config.MODEL_DIR / config.MODEL_FILENAME
-    model.booster_.save_model(str(model_path))
+    model_path = config.MODEL_DIR / config.CATBOOST_MODEL_FILENAME
+    model.save_model(str(model_path))
     print(f"\nModel saved to {model_path}")
 
     # Save feature list for prediction
@@ -222,4 +211,3 @@ def train() -> None:
 
 if __name__ == "__main__":
     train()
-

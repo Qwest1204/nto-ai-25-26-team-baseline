@@ -107,7 +107,7 @@ CATBOOST_PARAMS = {
     "l2_leaf_reg": 3.0,
     "bagging_temperature": 1.0,
     "random_strength": 1.0,
-    "border_count": 254,
+    "max_bin": 254,
     "random_seed": RANDOM_STATE,
     "thread_count": -1,
     "verbose": 100,
@@ -115,7 +115,6 @@ CATBOOST_PARAMS = {
     "task_type": "GPU" if torch and torch.cuda.is_available() else "CPU",
     "devices": "0" if torch and torch.cuda.is_available() else None,
     # экономия памяти
-    "max_bin": 254,
     "used_ram_limit": "12gb",
 }
 
