@@ -38,7 +38,7 @@ MODEL_FILENAME_PATTERN = "lgb_fold_{fold}.txt"  # Deprecated: kept for backwards
 MODEL_FILENAME = "lgb_model.txt"  # Single model filename for temporal split
 
 # --- TF-IDF PARAMETERS ---
-TFIDF_MAX_FEATURES = 500
+TFIDF_MAX_FEATURES = 100 #УМЕНЬШИЛ Т К НЕ ТЯНЕТ!
 TFIDF_MIN_DF = 2
 TFIDF_MAX_DF = 0.95
 TFIDF_NGRAM_RANGE = (1, 2)
@@ -51,6 +51,14 @@ BERT_EMBEDDING_DIM = 768
 BERT_DEVICE = "cuda" if torch and torch.cuda.is_available() else "cpu"
 # Limit GPU memory usage to prevent overheating and OOM errors
 BERT_GPU_MEMORY_FRACTION = 0.75
+
+# --- NOMIC PARAMETERS ---
+NOMIC_MODEL_NAME = constants.NOMIC_MODEL_NAME
+NOMIC_BATCH_SIZE = 2
+NOMIC_MAX_LENGTH = 8192
+NOMIC_EMBEDDING_DIM = 768
+NOMIC_DEVICE = "cuda" if torch and torch.cuda.is_available() else "cpu"
+NOMIC_GPU_MEMORY_FRACTION = 0.75
 
 
 # --- FEATURES ---

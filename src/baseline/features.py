@@ -313,6 +313,138 @@ def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df
     return df_with_bert
 
 
+def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
+    """Adds NOMIC embeddings from book descriptions.
+    Args:
+        df (pd.DataFrame): The main DataFrame to add features to.
+        _train_df (pd.DataFrame): The training portion (for consistency).
+        descriptions_df (pd.DataFrame): DataFrame with book descriptions.
+
+    Returns:
+        pd.DataFrame: The DataFrame with NOMIC embeddings added.
+    """
+    print("Adding text features (NOMIC embeddings)...")
+
+    # Ensure model directory exists
+    config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    embeddings_path = config.MODEL_DIR / constants.NOMIC_EMBEDDINGS_FILENAME
+
+    # Check if embeddings are already cached
+    if embeddings_path.exists():
+        print(f"Loading cached NOMIC embeddings from {embeddings_path}")
+        embeddings_dict = joblib.load(embeddings_path)
+    else:
+        print("Computing NOMIC embeddings (this may take a while)...")
+        print(f"Using device: {config.NOMIC_DEVICE}")
+
+        # Limit GPU memory usage to prevent OOM errors
+        if config.NOMIC_DEVICE == "cuda" and torch is not None:
+            torch.cuda.set_per_process_memory_fraction(config.NOMIC_GPU_MEMORY_FRACTION)
+            print(f"GPU memory limited to {config.NOMIC_GPU_MEMORY_FRACTION * 100:.0f}% of available memory")
+
+        # Load tokenizer and model
+        tokenizer = AutoTokenizer.from_pretrained(config.NOMIC_MODEL_NAME, trust_remote_code=True)
+        model = AutoModel.from_pretrained(config.NOMIC_MODEL_NAME, trust_remote_code=True)
+        model.to(config.NOMIC_DEVICE)
+        model.eval()
+
+        # Prepare descriptions: get unique book_id -> description mapping
+        all_descriptions = descriptions_df[[constants.COL_BOOK_ID, constants.COL_DESCRIPTION]].copy()
+        all_descriptions[constants.COL_DESCRIPTION] = all_descriptions[constants.COL_DESCRIPTION].fillna("")
+
+        # Get unique books and their descriptions
+        unique_books = all_descriptions.drop_duplicates(subset=[constants.COL_BOOK_ID])
+        book_ids = unique_books[constants.COL_BOOK_ID].to_numpy()
+        descriptions = unique_books[constants.COL_DESCRIPTION].to_numpy().tolist()
+
+        # Initialize embeddings dictionary
+        embeddings_dict = {}
+
+        # Process descriptions in batches
+        num_batches = (len(descriptions) + config.NOMIC_BATCH_SIZE - 1) // config.NOMIC_BATCH_SIZE
+
+        with torch.no_grad():
+            for batch_idx in tqdm(range(num_batches), desc="Processing NOMIC batches", unit="batch"):
+                start_idx = batch_idx * config.NOMIC_BATCH_SIZE
+                end_idx = min(start_idx + config.NOMIC_BATCH_SIZE, len(descriptions))
+                batch_descriptions = descriptions[start_idx:end_idx]
+                batch_book_ids = book_ids[start_idx:end_idx]
+
+                # Tokenize batch
+                encoded = tokenizer(
+                    batch_descriptions,
+                    padding=True,
+                    truncation=True,
+                    max_length=config.NOMIC_MAX_LENGTH,
+                    return_tensors="pt",
+                )
+
+                # Move to device
+                encoded = {k: v.to(config.NOMIC_DEVICE) for k, v in encoded.items()}
+
+                # Get model outputs
+                outputs = model(**encoded)
+                last_hidden_state = outputs.last_hidden_state
+                # Mean pooling: average over sequence length dimension
+                # outputs.last_hidden_state shape: (batch_size, seq_len, hidden_size)
+                attention_mask = encoded["attention_mask"]
+                # Expand attention mask to match hidden_size dimension for broadcasting
+
+
+                #Pooling изменен по сравнению с BERT из за специфики nomic
+                attention_mask_expanded = attention_mask.unsqueeze(-1).expand_as(last_hidden_state).float()
+
+                # Создаем маску, которая исключает первые и последние токены
+                seq_mask = torch.ones_like(attention_mask_expanded)
+                seq_mask[:, 0] = 0  # исключаем первый токен ([CLS])
+                seq_mask[:, -1] = 0  # исключаем последний токен ([SEP])
+
+                combined_mask = attention_mask_expanded * seq_mask
+                sum_embeddings = torch.sum(last_hidden_state * combined_mask, dim=1)
+                sum_mask = torch.clamp(combined_mask.sum(dim=1), min=1e-9)
+
+                # Mean pooling
+                mean_pooled = sum_embeddings / sum_mask
+
+                # Convert to numpy and store
+                batch_embeddings = mean_pooled.cpu().numpy()
+
+                for book_id, embedding in zip(batch_book_ids, batch_embeddings, strict=False):
+                    embeddings_dict[book_id] = embedding
+
+                # Small pause between batches to let GPU cool down and prevent overheating
+                if config.NOMIC_DEVICE == "cuda":
+                    time.sleep(0.2)  # 200ms pause between batches
+
+        # Save embeddings for future use
+        joblib.dump(embeddings_dict, embeddings_path)
+        print(f"Saved NOMIC embeddings to {embeddings_path}")
+
+    # Map embeddings to DataFrame rows by book_id
+    df_book_ids = df[constants.COL_BOOK_ID].to_numpy()
+
+    # Create embedding matrix
+    embeddings_list = []
+    for book_id in df_book_ids:
+        if book_id in embeddings_dict:
+            embeddings_list.append(embeddings_dict[book_id])
+        else:
+            # Zero embedding for books without descriptions
+            embeddings_list.append(np.zeros(config.NOMIC_EMBEDDING_DIM))
+
+    embeddings_array = np.array(embeddings_list)
+
+    # Create DataFrame with NOMIC features
+    nomic_feature_names = [f"nomic_{i}" for i in range(config.NOMIC_EMBEDDING_DIM)]
+    nomic_df = pd.DataFrame(embeddings_array, columns=nomic_feature_names, index=df.index)
+
+    # Concatenate NOMIC features with main DataFrame
+    df_with_nomic = pd.concat([df.reset_index(drop=True), nomic_df.reset_index(drop=True)], axis=1)
+
+    print(f"Added {len(nomic_feature_names)} NOMIC features.")
+    return df_with_nomic
+
+
 def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:  # noqa: C901
     """Fills missing values using a defined strategy.
 
@@ -366,6 +498,11 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
     for col in bert_cols:
         df[col] = df[col].fillna(0.0)
 
+    #Fill Nomic skips
+    nomic_cols = [col for col in df.columns if col.startswith("nomic_")]
+    for col in nomic_cols:
+        df[col] = df[col].fillna(0.0)
+
     # Fill remaining categorical features with a special value
     for col in config.CAT_FEATURES:
         if col in df.columns:
@@ -381,8 +518,9 @@ def create_features(
     df: pd.DataFrame,
     book_genres_df: pd.DataFrame,
     descriptions_df: pd.DataFrame,
-    include_aggregates: bool = False,
-    include_bert: bool = True,
+    include_aggregates: bool = True,
+    include_bert: bool = False,
+    include_nomic: bool = True,
 ) -> pd.DataFrame:
     """Runs the full feature engineering pipeline.
 
@@ -416,9 +554,11 @@ def create_features(
     df = add_genre_features(df, book_genres_df)
     df = add_text_features(df, train_df, descriptions_df)
     if include_bert:
+        print("USING BERT FEATURES")
         df = add_bert_features(df, train_df, descriptions_df)
-    else:
-        print("BERT features disabled (include_bert=False)")
+    elif include_nomic:
+        print("USING NOMIC FEATURES")
+        df = add_nomic_features(df, train_df, descriptions_df)
     df = handle_missing_values(df, train_df)
 
     # Convert categorical columns to pandas 'category' dtype for LightGBM

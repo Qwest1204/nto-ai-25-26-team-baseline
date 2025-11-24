@@ -36,7 +36,7 @@ def prepare_data() -> None:
     # Apply feature engineering WITHOUT aggregates
     # Aggregates will be computed during training on train split only
     # BERT disabled for faster testing (can be enabled by setting include_bert=True)
-    featured_df = create_features(merged_df, book_genres_df, descriptions_df, include_aggregates=False, include_bert=False)
+    featured_df = create_features(merged_df, book_genres_df, descriptions_df, include_aggregates=False, include_bert=False, include_nomic=True)
 
     # Ensure processed directory exists
     config.PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
