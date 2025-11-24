@@ -23,14 +23,14 @@ SUBMISSION_DIR = OUTPUT_DIR / "submissions"
 
 
 # --- PARAMETERS ---
-N_SPLITS = 5  # Deprecated: kept for backwards compatibility, not used in temporal split
+N_SPLITS = 8  # Deprecated: kept for backwards compatibility, not used in temporal split
 RANDOM_STATE = 42
 TARGET = constants.COL_RELEVANCE  # Multiclass target: 0=cold, 1=planned, 2=read
 
 # --- TEMPORAL SPLIT CONFIG ---
 # Ratio of data to use for training (0 < TEMPORAL_SPLIT_RATIO < 1)
 # 0.8 means 80% of data points (by timestamp) go to train, 20% to validation
-TEMPORAL_SPLIT_RATIO = 0.8
+TEMPORAL_SPLIT_RATIO = 0.7
 
 # --- TRAINING CONFIG ---
 EARLY_STOPPING_ROUNDS = 50
@@ -103,7 +103,7 @@ CATBOOST_PARAMS = {
     "eval_metric": "TotalF1",
     "iterations": 3000,
     "learning_rate": 0.03,
-    "depth": 10,
+    "depth": 4,
     "l2_leaf_reg": 3.0,
     "bagging_temperature": 1.0,
     "random_strength": 1.0,
@@ -115,7 +115,7 @@ CATBOOST_PARAMS = {
     "task_type": "GPU" if torch and torch.cuda.is_available() else "CPU",
     "devices": "0" if torch and torch.cuda.is_available() else None,
     # экономия памяти
-    "used_ram_limit": "12gb",
+    #"used_ram_limit": "12gb",
 }
 
 # трейн конфиг
