@@ -111,7 +111,7 @@ CATBOOST_PARAMS = {
     "random_seed": RANDOM_STATE,
     "thread_count": -1,
     "verbose": 100,
-    "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+    #"early_stopping_rounds": EARLY_STOPPING_ROUNDS,
     "task_type": "GPU" if torch and torch.cuda.is_available() else "CPU",
     "devices": "0" if torch and torch.cuda.is_available() else None,
     # экономия памяти
