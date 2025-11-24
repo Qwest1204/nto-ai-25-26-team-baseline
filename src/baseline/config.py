@@ -34,8 +34,9 @@ TEMPORAL_SPLIT_RATIO = 0.8
 
 # --- TRAINING CONFIG ---
 EARLY_STOPPING_ROUNDS = 50
-MODEL_FILENAME_PATTERN = "lgb_fold_{fold}.txt"  # Deprecated: kept for backwards compatibility
-MODEL_FILENAME = "lgb_model.txt"  # Single model filename for temporal split
+GBM_MODEL_FILENAME_PATTERN = "lgb_fold_{fold}.txt"  # Deprecated: kept for backwards compatibility
+GBM_MODEL_FILENAME = "lgb_model.txt"  # Single model filename for temporal split
+CATBOOST_MODEL_FILENAME = "catboost_model.cbm"
 
 # --- TF-IDF PARAMETERS ---
 TFIDF_MAX_FEATURES = 500
@@ -65,7 +66,7 @@ CAT_FEATURES = [
     constants.COL_PUBLISHER,
 ]
 
-# --- MODEL PARAMETERS ---
+# --- MODEL GBM PARAMETERS ---
 # Changed for Stage 2B: multiclass classification (3 classes) instead of binary
 # Classes: 0=cold candidates, 1=planned books, 2=read books
 LGB_PARAMS = {
@@ -96,3 +97,30 @@ LGB_FIT_PARAMS = {
     "callbacks": [],  # Placeholder for early stopping callback
 }
 
+# --- MODEL CATBOOST PARAMETERS ---
+CATBOOST_PARAMS = {
+    "loss_function": "MultiClass",
+    "eval_metric": "TotalF1",
+    "iterations": 3000,
+    "learning_rate": 0.03,
+    "depth": 10,
+    "l2_leaf_reg": 3.0,
+    "bagging_temperature": 1.0,
+    "random_strength": 1.0,
+    "border_count": 254,
+    "random_seed": RANDOM_STATE,
+    "thread_count": -1,
+    "verbose": 100,
+    "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+    "task_type": "GPU" if torch and torch.cuda.is_available() else "CPU",
+    "devices": "0" if torch and torch.cuda.is_available() else None,
+    # экономия памяти
+    "max_bin": 254,
+    "used_ram_limit": "12gb",
+}
+
+# трейн конфиг
+CATBOOST_FIT_KWARGS = {
+    "use_best_model": True,
+    "plot": False,
+}
