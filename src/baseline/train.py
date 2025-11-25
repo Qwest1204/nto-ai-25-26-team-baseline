@@ -110,11 +110,10 @@ def train() -> None:
     non_feature_object_cols = train_split_final[features].select_dtypes(include=["object"]).columns.tolist()
     features = [f for f in features if f not in non_feature_object_cols]
 
-    X_train = train_split_final[features].copy()
-    y_train = train_split_final[config.TARGET]
-    X_val = val_split_final[features].copy()
-    y_val = val_split_final[config.TARGET]
-
+    X_train = train_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
+    y_train = train_split_final[config.TARGET].replace({1: 0, 2: 1})
+    X_val = val_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
+    y_val = val_split_final[config.TARGET].replace({1: 0, 2: 1})
     # Optimize memory usage: convert float64 to float32 (reduces memory by ~50%)
     print("Optimizing data types for memory efficiency...")
     float64_cols = X_train.select_dtypes(include=["float64"]).columns
