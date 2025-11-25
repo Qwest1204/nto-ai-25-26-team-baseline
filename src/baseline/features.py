@@ -12,6 +12,10 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+
 from . import config, constants
 
 
@@ -183,6 +187,41 @@ def add_text_features(df: pd.DataFrame, train_df: pd.DataFrame, descriptions_df:
     print(f"Added {len(tfidf_feature_names)} TF-IDF features.")
     return df_with_tfidf
 
+def compress_embedding_pca(embeddings_dict: dict, n_components: int, train_book_ids: set) -> dict:
+    """
+    Compresses embeddings using PCA, fitting on training data only.
+
+    Args:
+        embeddings_dict (dict): Dictionary of book_id to embedding vectors.
+        n_components (int): Number of principal components to retain.
+        train_book_ids (set): Set of book_ids from the training data.
+
+    Returns:
+        dict: Dictionary of book_id to compressed embedding vectors.
+    """
+    scaler = StandardScaler()
+    pca = PCA(n_components=n_components)
+
+    # Extract training embeddings
+    train_embeddings = np.array([embeddings_dict[bid] for bid in train_book_ids if bid in embeddings_dict])
+
+    # Fit scaler and PCA on training embeddings
+    if len(train_embeddings) > 0:
+        train_scaled = scaler.fit_transform(train_embeddings)
+        pca.fit(train_scaled)
+    else:
+        raise ValueError("No training embeddings available for PCA fitting.")
+
+    # Transform all embeddings
+    keys = list(embeddings_dict.keys())
+    all_embeddings = np.array(list(embeddings_dict.values()))
+    all_scaled = scaler.transform(all_embeddings)
+    pca_result = pca.transform(all_scaled)
+
+    # Reconstruct compressed dictionary
+    compressed_dict = {key: pca_result[i] for i, key in enumerate(keys)}
+    print(f"Successfully compressed embeddings to {n_components}")
+    return compressed_dict
 
 def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
     """Adds BERT embeddings from book descriptions.
@@ -313,18 +352,20 @@ def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df
     return df_with_bert
 
 
-def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
-    """Adds NOMIC embeddings from book descriptions.
+def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame, n_components: int = 64) -> pd.DataFrame:
+    """
+    Adds NOMIC embeddings from book descriptions, with PCA compression fitted on training data.
+
     Args:
         df (pd.DataFrame): The main DataFrame to add features to.
-        _train_df (pd.DataFrame): The training portion (for consistency).
+        _train_df (pd.DataFrame): The training portion (for consistency in PCA fitting).
         descriptions_df (pd.DataFrame): DataFrame with book descriptions.
+        n_components (int, optional): Number of PCA components. Defaults to 64.
 
     Returns:
-        pd.DataFrame: The DataFrame with NOMIC embeddings added.
+        pd.DataFrame: The DataFrame with compressed NOMIC embeddings added.
     """
     print("Adding text features (NOMIC embeddings)...")
-
     # Ensure model directory exists
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
     embeddings_path = config.MODEL_DIR / constants.NOMIC_EMBEDDINGS_FILENAME
@@ -362,7 +403,6 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
 
         # Process descriptions in batches
         num_batches = (len(descriptions) + config.NOMIC_BATCH_SIZE - 1) // config.NOMIC_BATCH_SIZE
-
         with torch.no_grad():
             for batch_idx in tqdm(range(num_batches), desc="Processing NOMIC batches", unit="batch"):
                 start_idx = batch_idx * config.NOMIC_BATCH_SIZE
@@ -385,21 +425,18 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
                 # Get model outputs
                 outputs = model(**encoded)
                 last_hidden_state = outputs.last_hidden_state
+
                 # Mean pooling: average over sequence length dimension
-                # outputs.last_hidden_state shape: (batch_size, seq_len, hidden_size)
                 attention_mask = encoded["attention_mask"]
                 # Expand attention mask to match hidden_size dimension for broadcasting
-
-
-                #Pooling изменен по сравнению с BERT из за специфики nomic
                 attention_mask_expanded = attention_mask.unsqueeze(-1).expand_as(last_hidden_state).float()
 
-                # Создаем маску, которая исключает первые и последние токены
+                # Create mask that excludes first and last tokens
                 seq_mask = torch.ones_like(attention_mask_expanded)
-                seq_mask[:, 0] = 0  # исключаем первый токен ([CLS])
-                seq_mask[:, -1] = 0  # исключаем последний токен ([SEP])
-
+                seq_mask[:, 0] = 0  # exclude first token ([CLS])
+                seq_mask[:, -1] = 0  # exclude last token ([SEP])
                 combined_mask = attention_mask_expanded * seq_mask
+
                 sum_embeddings = torch.sum(last_hidden_state * combined_mask, dim=1)
                 sum_mask = torch.clamp(combined_mask.sum(dim=1), min=1e-9)
 
@@ -408,7 +445,6 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
 
                 # Convert to numpy and store
                 batch_embeddings = mean_pooled.cpu().numpy()
-
                 for book_id, embedding in zip(batch_book_ids, batch_embeddings, strict=False):
                     embeddings_dict[book_id] = embedding
 
@@ -420,6 +456,12 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
         joblib.dump(embeddings_dict, embeddings_path)
         print(f"Saved NOMIC embeddings to {embeddings_path}")
 
+    # Get train book ids for PCA fitting
+    train_book_ids = set(_train_df[constants.COL_BOOK_ID].unique())
+
+    # Compress embeddings using PCA
+    embeddings_dict = compress_embedding_pca(embeddings_dict, n_components, train_book_ids)
+
     # Map embeddings to DataFrame rows by book_id
     df_book_ids = df[constants.COL_BOOK_ID].to_numpy()
 
@@ -430,18 +472,17 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
             embeddings_list.append(embeddings_dict[book_id])
         else:
             # Zero embedding for books without descriptions
-            embeddings_list.append(np.zeros(config.NOMIC_EMBEDDING_DIM))
+            embeddings_list.append(np.zeros(n_components))
 
     embeddings_array = np.array(embeddings_list)
 
     # Create DataFrame with NOMIC features
-    nomic_feature_names = [f"nomic_{i}" for i in range(config.NOMIC_EMBEDDING_DIM)]
+    nomic_feature_names = [f"nomic_pca_{i}" for i in range(n_components)]
     nomic_df = pd.DataFrame(embeddings_array, columns=nomic_feature_names, index=df.index)
 
     # Concatenate NOMIC features with main DataFrame
     df_with_nomic = pd.concat([df.reset_index(drop=True), nomic_df.reset_index(drop=True)], axis=1)
-
-    print(f"Added {len(nomic_feature_names)} NOMIC features.")
+    print(f"Added {len(nomic_feature_names)} compressed NOMIC features.")
     return df_with_nomic
 
 
@@ -558,7 +599,7 @@ def create_features(
         df = add_bert_features(df, train_df, descriptions_df)
     elif include_nomic:
         print("USING NOMIC FEATURES")
-        df = add_nomic_features(df, train_df, descriptions_df)
+        df = add_nomic_features(df, train_df, descriptions_df, n_components=config.PCA_NUM_COMPONENTS)
     df = handle_missing_values(df, train_df)
 
     # Convert categorical columns to pandas 'category' dtype for LightGBM
