@@ -35,7 +35,7 @@ TEMPORAL_SPLIT_RATIO = 0.8
 # --- TRAINING CONFIG ---
 EARLY_STOPPING_ROUNDS = 50
 MODEL_FILENAME_PATTERN = "lgb_fold_{fold}.txt"  # Deprecated: kept for backwards compatibility
-MODEL_FILENAME = "lgb_model.txt"  # Single model filename for temporal split
+MODEL_FILENAME = "lgb_model.cbm"  # Single model filename for temporal split
 
 # --- TF-IDF PARAMETERS ---
 TFIDF_MAX_FEATURES = 500
@@ -65,36 +65,6 @@ CAT_FEATURES = [
     constants.COL_PUBLISHER,
 ]
 
-# --- MODEL PARAMETERS ---
-# Changed for Stage 2B: multiclass classification (3 classes) instead of binary
-# Classes: 0=cold candidates, 1=planned books, 2=read books
-LGB_PARAMS = {
-    "objective": "multiclass",
-    "num_class": 3,
-    "metric": "multi_logloss",
-    "n_estimators": 2000,
-    "learning_rate": 0.01,
-    "feature_fraction": 0.8,
-    "bagging_fraction": 0.8,
-    "bagging_freq": 1,
-    "lambda_l1": 0.1,
-    "lambda_l2": 0.1,
-    "num_leaves": 31,
-    "verbose": -1,
-    "n_jobs": -1,
-    "seed": RANDOM_STATE,
-    "boosting_type": "gbdt",
-    # Memory optimization parameters to prevent hanging on large datasets
-    "max_bin": 255,  # Reduce from default 255 to use less memory (already optimal)
-    "force_row_wise": True,  # Use row-wise data loading for better memory efficiency with large datasets
-}
-
-# LightGBM's fit method allows for a list of callbacks, including early stopping.
-# To use it, we need to specify parameters for the early stopping callback.
-LGB_FIT_PARAMS = {
-    "eval_metric": "multi_logloss",
-    "callbacks": [],  # Placeholder for early stopping callback
-}
 
 CATBOOST_PARAMS = {
     "loss_function": "MultiClass",

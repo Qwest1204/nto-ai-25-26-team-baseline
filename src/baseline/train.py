@@ -111,9 +111,9 @@ def train() -> None:
     features = [f for f in features if f not in non_feature_object_cols]
 
     X_train = train_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
-    y_train = train_split_final[config.TARGET].replace({1: 0, 2: 1})
+    y_train = train_split_final[config.TARGET]
     X_val = val_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
-    y_val = val_split_final[config.TARGET].replace({1: 0, 2: 1})
+    y_val = val_split_final[config.TARGET]
     # Optimize memory usage: convert float64 to float32 (reduces memory by ~50%)
     print("Optimizing data types for memory efficiency...")
     float64_cols = X_train.select_dtypes(include=["float64"]).columns
@@ -182,15 +182,13 @@ def train() -> None:
     # Save the trained model
     model_path = config.MODEL_DIR / config.MODEL_FILENAME
     model.save_model(str(model_path))
-    print(f"\nModel saved to {model_path}")
+    print(f"Model saved → {model_path}")
 
-    # Save feature list for prediction
-    features_path = config.MODEL_DIR / "features_list.json"
-    with open(features_path, "w") as f:
+    with open(config.MODEL_DIR / "features_list.json", "w") as f:
         json.dump(features, f)
-    print(f"Feature list saved to {features_path}")
+    print(f"Feature list saved → {config.MODEL_DIR / 'features_list.json'}")
 
-    print("\nTraining complete.")
+    print("\nTraining completed successfully.")
 
 
 if __name__ == "__main__":

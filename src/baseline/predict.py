@@ -5,10 +5,11 @@ Computes aggregate features on all train data and applies them to test set,
 then generates predictions using the trained model and ranks candidates for each user.
 """
 
+import json
 import numpy as np
-
-import lightgbm as lgb
 import pandas as pd
+
+from catboost import CatBoostClassifier, Pool
 
 from . import config, constants
 from .data_processing import expand_candidates, load_and_merge_data
@@ -142,7 +143,6 @@ def predict() -> None:
     candidates_final = handle_missing_values(candidates_with_agg, train_df)
 
     # Load feature list saved during training
-    import json
     features_path = config.MODEL_DIR / "features_list.json"
     if features_path.exists():
         print("Loading feature list from training...")
@@ -207,9 +207,9 @@ def predict() -> None:
     # Final check: ensure we have all features in the exact order
     features = [f for f in features if f in candidates_final.columns]
 
-    # Convert categorical columns to pandas 'category' dtype for LightGBM (same as in train.py)
+    # Convert categorical columns to pandas 'category' dtype for CatBoost (same as in train.py)
     # Use categories from featured_df (processed data) to ensure they match training data
-    # This is critical: LightGBM requires exact match of categorical features
+    # This is critical: CatBoost requires exact match of categorical features
     # Only process columns that were actually categorical in training data
     for col in features:
         if col in featured_df.columns and featured_df[col].dtype.name == "category":
@@ -240,8 +240,11 @@ def predict() -> None:
                 ).fillna(train_categories[0])
                 candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_categories, ordered=False)
 
-    X_test = candidates_final[features]
-    print(f"Prediction features: {len(features)}")
+    X_test = candidates_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1, errors="ignore")
+    print(f"Prediction features: {len(X_test.columns)}")  # Updated to use X_test.columns
+
+    # Identify categorical features for CatBoost, similar to training
+    categorical_features = [f for f in X_test.columns if X_test[f].dtype.name == "category"]
 
     # Load trained model
     model_path = config.MODEL_DIR / config.MODEL_FILENAME
@@ -251,27 +254,32 @@ def predict() -> None:
         )
 
     print(f"\nLoading model from {model_path}...")
-    # Load Booster directly
-    model = lgb.Booster(model_file=str(model_path))
+    model = CatBoostClassifier().load_model(str(model_path))
 
     # Generate probabilities for multiclass (3 classes)
-    # For multiclass, Booster.predict() returns probabilities for all classes
+    # For multiclass, model.predict_proba() returns probabilities for all classes
     # Shape: (n_samples, 3) with [p0, p1, p2] for each sample
     # p0 = probability of class 0 (cold candidates)
     # p1 = probability of class 1 (planned books)
     # p2 = probability of class 2 (read books)
     print("Generating predictions...")
-    test_proba_all = model.predict(X_test)  # Returns probabilities for all classes
-    # Convert to numpy array if needed and ensure it's 2D array: (n_samples, 3)
+    test_pool = Pool(X_test, cat_features=categorical_features)
+    test_proba_all = model.predict_proba(test_pool)  # Returns probabilities for all classes
+    # Convert to numpy array if needed and ensure it's 2D array: (n_samples, num_classes)
     test_proba_all = np.array(test_proba_all)
     if test_proba_all.ndim == 1:
-        # If it's 1D, reshape to (n_samples, 3)
-        test_proba_all = test_proba_all.reshape(-1, 3)
+        # If it's 1D, reshape to (n_samples, num_classes)
+        test_proba_all = test_proba_all.reshape(-1, test_proba_all.shape[0] // X_test.shape[0])
 
-    # Calculate ranking score: weighted sum of probabilities
-    # ranking_score = p0*0 + p1*1 + p2*2 = p1 + 2*p2
-    # Higher score = higher relevance (read books > planned books > cold candidates)
-    test_proba = test_proba_all[:, 1] * 1.0 + test_proba_all[:, 2] * 2.0
+    # Calculate ranking score adaptively based on number of classes
+    num_classes = test_proba_all.shape[1]
+    if num_classes == 3:
+        test_proba = test_proba_all[:, 1] * 1.0 + test_proba_all[:, 2] * 2.0
+    elif num_classes == 2:
+        # Assume classes 0 and 1 (cold and planned), ignore read
+        test_proba = test_proba_all[:, 1] * 1.0
+    else:
+        raise ValueError(f"Unexpected number of classes: {num_classes}")
 
     # Add predictions to candidates dataframe
     candidates_final["prediction"] = test_proba
@@ -318,4 +326,3 @@ def predict() -> None:
 
 if __name__ == "__main__":
     predict()
-
