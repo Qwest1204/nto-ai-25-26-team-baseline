@@ -18,6 +18,8 @@ SUBMISSION_FILENAME = "submission.csv"
 TFIDF_VECTORIZER_FILENAME = "tfidf_vectorizer.pkl"
 BERT_EMBEDDINGS_FILENAME = "bert_embeddings.pkl"
 BERT_MODEL_NAME = "DeepPavlov/rubert-base-cased"
+NOMIC_MODEL_NAME = "nomic-ai/nomic-embed-text-v1.5"
+NOMIC_EMBEDDINGS_FILENAME = "nomic_embeddings.pkl"
 PROCESSED_DATA_FILENAME = "processed_features.parquet"
 
 # --- COLUMN NAMES ---
