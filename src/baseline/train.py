@@ -29,7 +29,22 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import ndcg_score, precision_score, recall_score
 
+def statistics(y_val, val_preds):
+    cm = confusion_matrix(y_val, val_preds, labels=[0, 1])
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='RdYlBu',
+                xticklabels=['запланированные (1)', 'прочитанные (2)'],
+                yticklabels=['запланированные (1)', 'прочитанные (2)'])
+    plt.title('Confusion Matrix')
+    plt.xlabel('Предсказанные  классы')
+    plt.ylabel('Истинные классы')
+    plt.tight_layout()
+    plt.show()
 
+    print("Распределение истинных меток:")
+    print(pd.Series(y_val).value_counts().sort_index())
+    print("\nРаспределение предсказанных меток:")
+    print(pd.Series(val_preds).value_counts().sort_index())
 
 def train() -> None:
     """Runs the model training pipeline with temporal split.
@@ -43,6 +58,9 @@ def train() -> None:
 
     Note: Data must be prepared first using prepare_data.py
     """
+
+    show_statistics = True
+
     # Load prepared data
     processed_path = config.PROCESSED_DATA_DIR / constants.PROCESSED_DATA_FILENAME
 
@@ -180,22 +198,8 @@ def train() -> None:
     class_dist = pd.Series(val_preds).value_counts().sort_index()
     class_proba_mean = val_proba.mean(axis=0)
 
-    cm = confusion_matrix(y_val, val_preds, labels=[0, 1, 2])
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='RdYlBu',
-                xticklabels=['холодные (0)', 'запланированные (1)', 'прочитанные (2)'],
-                yticklabels=['холодные (0)', 'запланированные (1)', 'прочитанные (2)'])
-    plt.title('Confusion Matrix')
-    plt.xlabel('Предсказанные  классы')
-    plt.ylabel('Истинные классы')
-    plt.tight_layout()
-    plt.show()
-
-    print("Распределение истинных меток:")
-    print(pd.Series(y_val).value_counts().sort_index())
-
-    print("\nРаспределение предсказанных меток:")
-    print(pd.Series(val_preds).value_counts().sort_index())
+    if show_statistics:
+        statistics(y_val,val_preds)
 
     print(f"\nValidation metrics:")
     print(f"  Accuracy: {accuracy:.4f}")
@@ -205,7 +209,7 @@ def train() -> None:
     for class_idx in range(val_proba.shape[1]):
         count = class_dist.get(class_idx, 0)
         proba_mean = class_proba_mean[class_idx]
-        print(f"    Class {class_idx}: {count} samples ({100*count/len(val_preds):.1f}%), mean proba: {proba_mean:.4f}")
+        print(f"    Class {class_idx+1}: {count} samples ({100*count/len(val_preds):.1f}%), mean proba: {proba_mean:.4f}")
 
     # Save the trained model
     model_path = config.MODEL_DIR / config.MODEL_FILENAME
