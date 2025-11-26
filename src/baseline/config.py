@@ -103,3 +103,6 @@ CATBOOST_FIT_KWARGS = {
     "use_best_model": True,
     "plot": False,
 }
+
+# --- OPTUNA ---
+OPTIM_WITH_OPTUNA = True
