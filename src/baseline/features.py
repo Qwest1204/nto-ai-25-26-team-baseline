@@ -187,40 +187,56 @@ def add_text_features(df: pd.DataFrame, train_df: pd.DataFrame, descriptions_df:
     print(f"Added {len(tfidf_feature_names)} TF-IDF features.")
     return df_with_tfidf
 
-def compress_embedding_pca(embeddings_dict: dict, n_components: int, train_book_ids: set) -> dict:
+def compress_embeddings(embeddings_dict: dict, n_components: int, train_book_ids: set, method: str = 'pca') -> dict:
     """
-    Compresses embeddings using PCA, fitting on training data only.
+    Compresses embeddings using the specified method (PCA or t-SNE), fitting on training data where possible.
+
+    For PCA: Fits scaler and reducer on training embeddings only, transforms all.
+    For t-SNE: Fits scaler on training embeddings, scales all, but fits t-SNE on all scaled embeddings
+    (note: this includes validation/test influence on the non-linear embedding layout).
 
     Args:
         embeddings_dict (dict): Dictionary of book_id to embedding vectors.
-        n_components (int): Number of principal components to retain.
+        n_components (int): Number of components to retain.
         train_book_ids (set): Set of book_ids from the training data.
+        method (str): Compression method, 'pca' or 'tsne'. Defaults to 'pca'.
 
     Returns:
         dict: Dictionary of book_id to compressed embedding vectors.
     """
-    scaler = StandardScaler()
-    pca = PCA(n_components=n_components)
+    if method not in ['pca', 'tsne']:
+        raise ValueError("method must be one of ['pca', 'tsne']")
 
-    # Extract training embeddings
+    scaler = StandardScaler()
     train_embeddings = np.array([embeddings_dict[bid] for bid in train_book_ids if bid in embeddings_dict])
 
-    # Fit scaler and PCA on training embeddings
-    if len(train_embeddings) > 0:
-        train_scaled = scaler.fit_transform(train_embeddings)
-        pca.fit(train_scaled)
-    else:
-        raise ValueError("No training embeddings available for PCA fitting.")
+    if len(train_embeddings) == 0:
+        raise ValueError("No training embeddings available for fitting.")
 
-    # Transform all embeddings
+    # Fit scaler on training embeddings only
+    scaler.fit(train_embeddings)
+    train_scaled = scaler.transform(train_embeddings)
     keys = list(embeddings_dict.keys())
     all_embeddings = np.array(list(embeddings_dict.values()))
     all_scaled = scaler.transform(all_embeddings)
-    pca_result = pca.transform(all_scaled)
+
+    if method == 'pca':
+        reducer = PCA(n_components=n_components)
+        reducer.fit(train_scaled)
+        reduced = reducer.transform(all_scaled)
+    elif method == 'tsne':
+        print("Warning: t-SNE reducer is fitted on all scaled embeddings (includes non-training books for layout computation).")
+        reducer = TSNE(
+            n_components=n_components,
+            random_state=42,  # For reproducibility
+            verbose=1,
+            # Note: Add other TSNE params like perplexity, learning_rate if needed via config
+        )
+        reduced = reducer.fit_transform(all_scaled)
 
     # Reconstruct compressed dictionary
-    compressed_dict = {key: pca_result[i] for i, key in enumerate(keys)}
-    print(f"Successfully compressed embeddings to {n_components}")
+    compressed_dict = {key: reduced[i] for i, key in enumerate(keys)}
+    print(f"Successfully compressed embeddings to {n_components} dimensions using {method.upper()}")
     return compressed_dict
 
 def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
@@ -357,7 +373,7 @@ def add_nomic_features(
     _train_df: pd.DataFrame,
     descriptions_df: pd.DataFrame,
     use_compression: bool = True,
-    n_components: int = config.PCA_NUM_COMPONENTS,
+    n_components: int = config.NUM_COMPONENTS,
 ) -> pd.DataFrame:
     """
     Adds NOMIC embeddings from book descriptions, with optional PCA compression fitted on training data.
@@ -468,9 +484,9 @@ def add_nomic_features(
 
     # Optionally compress embeddings using PCA
     if use_compression:
-        embeddings_dict = compress_embedding_pca(embeddings_dict, n_components, train_book_ids)
+        embeddings_dict = compress_embeddings(embeddings_dict, n_components, train_book_ids, method=config.METHOD_OF_COMPRESS)  # or 'tsne'
         embedding_dim = n_components
-        feature_prefix = "nomic_pca_"
+        feature_prefix = "nomic_pca_" if config.METHOD_OF_COMPRESS == 'pca' else "nomic_tsne_"  # Adjust prefix if needed
     else:
         embedding_dim = config.NOMIC_EMBEDDING_DIM
         feature_prefix = "nomic_"

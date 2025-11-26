@@ -56,12 +56,10 @@ BERT_GPU_MEMORY_FRACTION = 0.75
 NOMIC_MODEL_NAME = constants.NOMIC_MODEL_NAME
 NOMIC_BATCH_SIZE = 2
 NOMIC_MAX_LENGTH = 8192
-NOMIC_EMBEDDING_DIM = 768
+NOMIC_EMBEDDING_DIM = 2048
 NOMIC_DEVICE = "cuda" if torch and torch.cuda.is_available() else "cpu"
-NOMIC_GPU_MEMORY_FRACTION = 0.75
+NOMIC_GPU_MEMORY_FRACTION = 0.95
 
-# --- PCA ---
-PCA_NUM_COMPONENTS = 100
 
 # --- FEATURES ---
 CAT_FEATURES = [
@@ -103,3 +101,6 @@ CATBOOST_FIT_KWARGS = {
     "use_best_model": True,
     "plot": False,
 }
+#compress embedding
+METHOD_OF_COMPRESS = 'tsne' #or pca
+NUM_COMPONENTS = 100
