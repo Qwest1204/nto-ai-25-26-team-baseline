@@ -17,6 +17,7 @@ __pycache__/
 data/
 !data/**/.gitkeep
 output/
+catboost_info/
 !output/**/.gitkeep
 
 # Temporary files
@@ -25,4 +26,6 @@ output/
 logs/
 .monitor_pid
 solution.csv
+
+
 

@@ -16,6 +16,7 @@ from .data_processing import expand_candidates, load_and_merge_data
 from .features import add_aggregate_features, handle_missing_values
 
 
+
 def predict() -> None:
     """Generates and saves ranked predictions for the test set.
 

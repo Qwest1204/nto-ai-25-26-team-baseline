@@ -19,6 +19,17 @@ from .features import add_aggregate_features, handle_missing_values
 from .temporal_split import get_split_date_from_ratio, temporal_split_by_date
 
 
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+from sklearn.metrics import ndcg_score, precision_score, recall_score
+
+
 
 def train() -> None:
     """Runs the model training pipeline with temporal split.
@@ -111,9 +122,9 @@ def train() -> None:
     features = [f for f in features if f not in non_feature_object_cols]
 
     X_train = train_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
-    y_train = train_split_final[config.TARGET]
+    y_train = train_split_final[config.TARGET].replace({1:0, 2:1})
     X_val = val_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
-    y_val = val_split_final[config.TARGET]
+    y_val = val_split_final[config.TARGET].replace({1:0, 2:1})
     # Optimize memory usage: convert float64 to float32 (reduces memory by ~50%)
     print("Optimizing data types for memory efficiency...")
     float64_cols = X_train.select_dtypes(include=["float64"]).columns
@@ -169,6 +180,23 @@ def train() -> None:
     class_dist = pd.Series(val_preds).value_counts().sort_index()
     class_proba_mean = val_proba.mean(axis=0)
 
+    cm = confusion_matrix(y_val, val_preds, labels=[0, 1, 2])
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='RdYlBu',
+                xticklabels=['холодные (0)', 'запланированные (1)', 'прочитанные (2)'],
+                yticklabels=['холодные (0)', 'запланированные (1)', 'прочитанные (2)'])
+    plt.title('Confusion Matrix')
+    plt.xlabel('Предсказанные  классы')
+    plt.ylabel('Истинные классы')
+    plt.tight_layout()
+    plt.show()
+
+    print("Распределение истинных меток:")
+    print(pd.Series(y_val).value_counts().sort_index())
+
+    print("\nРаспределение предсказанных меток:")
+    print(pd.Series(val_preds).value_counts().sort_index())
+
     print(f"\nValidation metrics:")
     print(f"  Accuracy: {accuracy:.4f}")
     print(f"  Precision (weighted): {precision:.4f}")
@@ -188,8 +216,9 @@ def train() -> None:
         json.dump(features, f)
     print(f"Feature list saved → {config.MODEL_DIR / 'features_list.json'}")
 
-    print("\nTraining completed successfully.")
+    print("\nTraining complete.")
 
 
 if __name__ == "__main__":
     train()
+
