@@ -156,7 +156,7 @@ def train() -> None:
             "bagging_temperature": trial.suggest_float("bagging_temperature", 0.5, 1.5),  # Around default 1.0
             "random_strength": trial.suggest_float("random_strength", 0.5, 2.0, log=True),  # Around default 1.0
             "max_bin": trial.suggest_int("max_bin", 100, 300, step=50),  # Around default 254
-            "rsm": trial.suggest_float("rsm", 0.5, 1.0),  # Around default 0.7
+            #"rsm": trial.suggest_float("rsm", 0.5, 1.0),  # Around default 0.7 - not for GPU!!!
             "random_seed": config.RANDOM_STATE,
             "thread_count": -1,
             "auto_class_weights": "Balanced",

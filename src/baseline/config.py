@@ -89,7 +89,7 @@ CATBOOST_PARAMS = {
     "random_seed": RANDOM_STATE,
     "thread_count": -1,
     "auto_class_weights": "Balanced",
-    "rsm": 0.7,
+    #"rsm": 0.7, - not avail for GPU!!!!
     #"verbose": 100,
     #"early_stopping_rounds": EARLY_STOPPING_ROUNDS,
     "task_type": "GPU" if torch and torch.cuda.is_available() else "CPU",
