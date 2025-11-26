@@ -352,18 +352,25 @@ def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df
     return df_with_bert
 
 
-def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame, n_components: int = 64) -> pd.DataFrame:
+def add_nomic_features(
+    df: pd.DataFrame,
+    _train_df: pd.DataFrame,
+    descriptions_df: pd.DataFrame,
+    use_compression: bool = True,
+    n_components: int = config.PCA_NUM_COMPONENTS,
+) -> pd.DataFrame:
     """
-    Adds NOMIC embeddings from book descriptions, with PCA compression fitted on training data.
+    Adds NOMIC embeddings from book descriptions, with optional PCA compression fitted on training data.
 
     Args:
         df (pd.DataFrame): The main DataFrame to add features to.
         _train_df (pd.DataFrame): The training portion (for consistency in PCA fitting).
         descriptions_df (pd.DataFrame): DataFrame with book descriptions.
-        n_components (int, optional): Number of PCA components. Defaults to 64.
+        use_compression (bool, optional): Whether to apply PCA compression. Defaults to True.
+        n_components (int, optional): Number of PCA components if compression is enabled. Defaults to config.PCA_NUM_COMPONENTS.
 
     Returns:
-        pd.DataFrame: The DataFrame with compressed NOMIC embeddings added.
+        pd.DataFrame: The DataFrame with (compressed) NOMIC embeddings added.
     """
     print("Adding text features (NOMIC embeddings)...")
     # Ensure model directory exists
@@ -456,11 +463,17 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
         joblib.dump(embeddings_dict, embeddings_path)
         print(f"Saved NOMIC embeddings to {embeddings_path}")
 
-    # Get train book ids for PCA fitting
+    # Get train book ids for PCA fitting (only if compressing)
     train_book_ids = set(_train_df[constants.COL_BOOK_ID].unique())
 
-    # Compress embeddings using PCA
-    embeddings_dict = compress_embedding_pca(embeddings_dict, n_components, train_book_ids)
+    # Optionally compress embeddings using PCA
+    if use_compression:
+        embeddings_dict = compress_embedding_pca(embeddings_dict, n_components, train_book_ids)
+        embedding_dim = n_components
+        feature_prefix = "nomic_pca_"
+    else:
+        embedding_dim = config.NOMIC_EMBEDDING_DIM
+        feature_prefix = "nomic_"
 
     # Map embeddings to DataFrame rows by book_id
     df_book_ids = df[constants.COL_BOOK_ID].to_numpy()
@@ -472,17 +485,17 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
             embeddings_list.append(embeddings_dict[book_id])
         else:
             # Zero embedding for books without descriptions
-            embeddings_list.append(np.zeros(n_components))
+            embeddings_list.append(np.zeros(embedding_dim))
 
     embeddings_array = np.array(embeddings_list)
 
     # Create DataFrame with NOMIC features
-    nomic_feature_names = [f"nomic_pca_{i}" for i in range(n_components)]
+    nomic_feature_names = [f"{feature_prefix}{i}" for i in range(embedding_dim)]
     nomic_df = pd.DataFrame(embeddings_array, columns=nomic_feature_names, index=df.index)
 
     # Concatenate NOMIC features with main DataFrame
     df_with_nomic = pd.concat([df.reset_index(drop=True), nomic_df.reset_index(drop=True)], axis=1)
-    print(f"Added {len(nomic_feature_names)} compressed NOMIC features.")
+    print(f"Added {len(nomic_feature_names)} {'compressed ' if use_compression else ''}NOMIC features.")
     return df_with_nomic
 
 
@@ -539,7 +552,7 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
     for col in bert_cols:
         df[col] = df[col].fillna(0.0)
 
-    #Fill Nomic skips
+    # Fill Nomic features with 0 (for books without descriptions)
     nomic_cols = [col for col in df.columns if col.startswith("nomic_")]
     for col in nomic_cols:
         df[col] = df[col].fillna(0.0)
@@ -562,6 +575,7 @@ def create_features(
     include_aggregates: bool = True,
     include_bert: bool = False,
     include_nomic: bool = True,
+    use_nomic_compression: bool = True,
 ) -> pd.DataFrame:
     """Runs the full feature engineering pipeline.
 
@@ -572,10 +586,12 @@ def create_features(
         df (pd.DataFrame): The merged DataFrame from `data_processing`.
         book_genres_df (pd.DataFrame): DataFrame mapping books to genres.
         descriptions_df (pd.DataFrame): DataFrame with book descriptions.
-        include_aggregates (bool): If True, compute aggregate features. Defaults to False.
+        include_aggregates (bool): If True, compute aggregate features. Defaults to True.
             Aggregates are typically computed separately during training to avoid data leakage.
-        include_bert (bool): If True, compute BERT embeddings. Defaults to True.
+        include_bert (bool): If True, compute BERT embeddings. Defaults to False.
             Set to False for faster testing.
+        include_nomic (bool): If True, compute NOMIC embeddings. Defaults to True.
+        use_nomic_compression (bool): If True and include_nomic is True, apply PCA compression to NOMIC embeddings. Defaults to True.
 
     Returns:
         pd.DataFrame: The final DataFrame with all features engineered.
@@ -599,7 +615,7 @@ def create_features(
         df = add_bert_features(df, train_df, descriptions_df)
     elif include_nomic:
         print("USING NOMIC FEATURES")
-        df = add_nomic_features(df, train_df, descriptions_df, n_components=config.PCA_NUM_COMPONENTS)
+        df = add_nomic_features(df, train_df, descriptions_df, use_compression=use_nomic_compression)
     df = handle_missing_values(df, train_df)
 
     # Convert categorical columns to pandas 'category' dtype for LightGBM
@@ -609,4 +625,3 @@ def create_features(
 
     print("Feature engineering complete.")
     return df
-
