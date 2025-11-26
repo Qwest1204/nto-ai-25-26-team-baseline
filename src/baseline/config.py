@@ -38,9 +38,9 @@ MODEL_FILENAME_PATTERN = "lgb_fold_{fold}.txt"  # Deprecated: kept for backwards
 MODEL_FILENAME = "lgb_model.cbm"  # Single model filename for temporal split
 
 # --- TF-IDF PARAMETERS ---
-TFIDF_MAX_FEATURES = 100 #УМЕНЬШИЛ Т К НЕ ТЯНЕТ!
-TFIDF_MIN_DF = 2
-TFIDF_MAX_DF = 0.95
+TFIDF_MAX_FEATURES = 500
+TFIDF_MIN_DF = 10
+TFIDF_MAX_DF = 0.7
 TFIDF_NGRAM_RANGE = (1, 2)
 
 # --- BERT PARAMETERS ---

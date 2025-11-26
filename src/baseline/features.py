@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import NMF
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
@@ -122,7 +123,7 @@ def add_text_features(df: pd.DataFrame, train_df: pd.DataFrame, descriptions_df:
     Returns:
         pd.DataFrame: The DataFrame with TF-IDF features added.
     """
-    print("Adding text features (TF-IDF)...")
+    print("Generating TF-IDF...")
 
     # Ensure model directory exists
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -178,10 +179,57 @@ def add_text_features(df: pd.DataFrame, train_df: pd.DataFrame, descriptions_df:
     )
 
     # Concatenate TF-IDF features with main DataFrame
-    df_with_tfidf = pd.concat([df.reset_index(drop=True), tfidf_df.reset_index(drop=True)], axis=1)
+    #df_with_tfidf = pd.concat([df.reset_index(drop=True), tfidf_df.reset_index(drop=True)], axis=1)
 
-    print(f"Added {len(tfidf_feature_names)} TF-IDF features.")
-    return df_with_tfidf
+    print(f"Generated TF-IDF")
+    return tfidf_df
+
+
+from sklearn.decomposition import TruncatedSVD
+
+
+def add_SVD_features(df: pd.DataFrame, X_tfidf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds SVD features - robust alternative to NMF for sparse data
+    """
+    print("Adding SVD features (optimal for sparse TF-IDF)")
+
+    config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    svd_path = config.MODEL_DIR / "svd_vectorizer.pkl"
+
+    if svd_path.exists():
+        print(f"Loading existing SVD from {svd_path}")
+        svd = joblib.load(svd_path)
+    else:
+        print("Fitting TruncatedSVD on TF-IDF features...")
+
+        n_components = 100
+
+        svd = TruncatedSVD(
+            n_components=n_components,
+            algorithm='randomized',  # быстрый
+            n_iter=10,
+            random_state=42
+        )
+
+        svd.fit(X_tfidf.values)
+        joblib.dump(svd, svd_path)
+        print(f"SVD saved to {svd_path}")
+
+    svd_matrix = svd.transform(X_tfidf.values)
+
+    svd_feature_names = [f"svd_component_{i}" for i in range(svd_matrix.shape[1])]
+    svd_df = pd.DataFrame(
+        svd_matrix,
+        columns=svd_feature_names,
+        index=df.index,
+    )
+
+    df_with_svd = pd.concat([df.reset_index(drop=True), svd_df.reset_index(drop=True)], axis=1)
+
+    print(f"Added {len(svd_feature_names)} SVD features.")
+
+    return df_with_svd
 
 
 def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
@@ -552,7 +600,11 @@ def create_features(
         df = add_aggregate_features(df, train_df)
 
     df = add_genre_features(df, book_genres_df)
-    df = add_text_features(df, train_df, descriptions_df)
+
+    #upgraded tf_idf
+    df_tf_idf = add_text_features(df, train_df, descriptions_df)
+    df = add_SVD_features(df, df_tf_idf)
+
     if include_bert:
         print("USING BERT FEATURES")
         df = add_bert_features(df, train_df, descriptions_df)
