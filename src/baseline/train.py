@@ -207,19 +207,19 @@ def train() -> None:
         #val_preds = model.predict(val_pool)
         return calculate_ndcg_val(model, val_pool, val_split_final, k=20)
 
-    if config.OPTIM_WITH_OPTUNA:
+    #if config.OPTIM_WITH_OPTUNA:
         # Run Optuna optimization
-        print("\nStarting Optuna hyperparameter optimization...")
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=50)  # Adjust n_trials as needed
+    print("\nStarting Optuna hyperparameter optimization...")
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=50)  # Adjust n_trials as needed
 
-        print("\nBest hyperparameters found:")
-        print(study.best_params)
-        print(f"Best F1 score: {study.best_value:.4f}")
+    print("\nBest hyperparameters found:")
+    print(study.best_params)
+    print(f"Best F1 score: {study.best_value:.4f}")
 
-        # Update parameters with best found
-        best_params = config.CATBOOST_PARAMS.copy()
-        best_params.update(study.best_params)
+    # Update parameters with best found
+    best_params = config.CATBOOST_PARAMS.copy()
+    best_params.update(study.best_params)
 
 
     # Train final model with best parameters
