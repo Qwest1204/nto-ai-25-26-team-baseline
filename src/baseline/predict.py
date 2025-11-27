@@ -9,7 +9,7 @@ import json
 import numpy as np
 import pandas as pd
 
-from catboost import CatBoostClassifier, Pool
+from catboost import CatBoostRanker, Pool
 
 from . import config, constants
 from .data_processing import expand_candidates, load_and_merge_data
@@ -23,11 +23,9 @@ def predict() -> None:
     1. Loads targets.csv and candidates.csv
     2. Expands candidates into (user_id, book_id) pairs
     3. Computes aggregate features on all train data
-    4. Generates probabilities for 3 classes using the trained multiclass model
-       (class 0=cold, 1=planned, 2=read)
-    5. Calculates ranking score: p1*1 + p2*2 (weighted sum based on relevance)
-    6. Ranks candidates for each user and selects top-K (K = min(20, num_candidates))
-    7. Saves submission.csv in format: user_id,book_id_list
+    4. Generates ranking scores using the trained ranker model
+    5. Ranks candidates for each user and selects top-K (K = min(20, num_candidates))
+    6. Saves submission.csv in format: user_id,book_id_list
 
     Note: Data must be prepared first using prepare_data.py, and model must be trained
     using train.py
@@ -134,77 +132,39 @@ def predict() -> None:
             book_text_features, on=constants.COL_BOOK_ID, how="left"
         )
 
-    # Compute aggregate features on ALL train data
+    # Compute aggregate features on ALL train data (no leakage concerns for prediction)
     print("\nComputing aggregate features on all train data...")
     candidates_with_agg = add_aggregate_features(candidates_with_meta.copy(), train_df)
 
-    # Handle missing values
+    # Handle missing values (use train_df for fill values)
     print("Handling missing values...")
     candidates_final = handle_missing_values(candidates_with_agg, train_df)
 
-    # Load feature list saved during training
+    # Load feature list from training
     features_path = config.MODEL_DIR / "features_list.json"
-    if features_path.exists():
-        print("Loading feature list from training...")
-        with open(features_path, "r") as f:
-            features = json.load(f)
-        print(f"Loaded {len(features)} features from training")
-    else:
-        # Fallback: use same logic as training
-        print("Warning: Feature list not found, using fallback logic")
-        exclude_cols = [
-            constants.COL_SOURCE,
-            config.TARGET,
-            constants.COL_PREDICTION,
-            constants.COL_TIMESTAMP,
-        ]
-        train_features = [col for col in train_df.columns if col not in exclude_cols]
-        train_non_feature_object_cols = train_df[train_features].select_dtypes(include=["object"]).columns.tolist()
-        features = [f for f in train_features if f not in train_non_feature_object_cols]
+    if not features_path.exists():
+        raise FileNotFoundError(f"Features list not found at {features_path}.")
 
-    # Remove any columns that shouldn't be features (like title, author_name, etc.)
-    exclude_cols = [
-        constants.COL_SOURCE,
-        config.TARGET,
-        constants.COL_PREDICTION,
-        constants.COL_TIMESTAMP,
-        constants.COL_USER_ID,
-        constants.COL_BOOK_ID,
-    ]
-    candidates_final = candidates_final.drop(
-        columns=[col for col in candidates_final.columns if col not in features and col not in exclude_cols + [constants.COL_USER_ID, constants.COL_BOOK_ID]],
-        errors="ignore"
-    )
+    with open(features_path, "r") as f:
+        features = json.load(f)
 
-    # Add missing features with default values
-    missing_features = [f for f in features if f not in candidates_final.columns]
+    # Handle missing features in candidates by filling with a default value (e.g., 0 or mode from train)
+    # This ensures the feature set matches exactly what was used in training
+    missing_features = [feat for feat in features if feat not in candidates_final.columns]
     if missing_features:
         print(f"Warning: Missing {len(missing_features)} features in candidates, adding defaults")
         for feat in missing_features:
+            # Fill with 0 for numeric, or mode from train if available
             if feat in train_df.columns:
-                if train_df[feat].dtype.name == "category":
-                    default_val = train_df[feat].cat.categories[0] if len(train_df[feat].cat.categories) > 0 else 0
-                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final), categories=train_df[feat].cat.categories, ordered=False)
+                if pd.api.types.is_numeric_dtype(train_df[feat]):
+                    candidates_final[feat] = 0
                 else:
-                    candidates_final[feat] = train_df[feat].iloc[0] if len(train_df) > 0 else 0
+                    mode_val = train_df[feat].mode().iloc[0] if not train_df[feat].mode().empty else "unknown"
+                    candidates_final[feat] = mode_val
             else:
-                candidates_final[feat] = 0
+                candidates_final[feat] = 0  # Default fallback
 
-    # Ensure all features exist in candidates_final (add missing ones)
-    # features list is from training, so we need all of them
-    for feat in features:
-        if feat not in candidates_final.columns:
-            # Add with default value
-            if feat in train_df.columns:
-                if train_df[feat].dtype.name == "category":
-                    default_val = train_df[feat].cat.categories[0] if len(train_df[feat].cat.categories) > 0 else 0
-                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final), categories=train_df[feat].cat.categories, ordered=False)
-                else:
-                    candidates_final[feat] = train_df[feat].iloc[0] if len(train_df) > 0 else 0
-            else:
-                candidates_final[feat] = 0
-
-    # Final check: ensure we have all features in the exact order
+    # Reorder features in the exact order
     features = [f for f in features if f in candidates_final.columns]
 
     # Convert categorical columns to pandas 'category' dtype for CatBoost (same as in train.py)
@@ -240,6 +200,10 @@ def predict() -> None:
                 ).fillna(train_categories[0])
                 candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_categories, ordered=False)
 
+    # CRITICAL: Sort by group_id (user_id) to ensure contiguous groups for Ranker
+    print("Sorting candidates by user_id for CatBoostRanker...")
+    candidates_final = candidates_final.sort_values(constants.COL_USER_ID).reset_index(drop=True)
+
     X_test = candidates_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1, errors="ignore")
     print(f"Prediction features: {len(X_test.columns)}")  # Updated to use X_test.columns
 
@@ -254,22 +218,17 @@ def predict() -> None:
         )
 
     print(f"\nLoading model from {model_path}...")
-    model = CatBoostClassifier().load_model(str(model_path))
+    model = CatBoostRanker().load_model(str(model_path))
 
-    # Generate probabilities for multiclass (3 classes)
-    # For multiclass, model.predict_proba() returns probabilities for all classes
-    # Shape: (n_samples, 3) with [p0, p1, p2] for each sample
-    # p0 = probability of class 0 (cold candidates)
-    # p1 = probability of class 1 (planned books)
-    # p2 = probability of class 2 (read books)
+    # Generate ranking scores
     print("Generating predictions...")
     test_pool = Pool(
         data=X_test,
-        group_id=candidates_final[constants.COL_USER_ID],  # обязательно!
+        group_id=candidates_final[constants.COL_USER_ID],
         cat_features=categorical_features
     )
-    rank_scores = model.predict(test_pool)  # Returns probabilities for all classes
-    # Convert to numpy array if needed and ensure it's 2D array: (n_samples, num_classes)
+    rank_scores = model.predict(test_pool)
+
     # Add predictions to candidates dataframe
     candidates_final["prediction"] = rank_scores
 
