@@ -173,7 +173,7 @@ def train() -> None:
         cat_features=categorical_features
     )
 
-    best_params = config.CATBOOST_PARAMS.copy()
+    #est_params = config.CATBOOST_PARAMS.copy()
 
     # Define Optuna objective
     def objective(trial):

@@ -86,7 +86,7 @@ CATBOOST_PARAMS = {
     "max_bin": 254,
     "random_seed": RANDOM_STATE,
     "thread_count": -1,
-    "auto_class_weights": "Balanced",
+    #"auto_class_weights": "Balanced",
     #"rsm": 0.7, - not avail for GPU!!!!
     #"verbose": 100,
     #"early_stopping_rounds": EARLY_STOPPING_ROUNDS,
