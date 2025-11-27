@@ -239,17 +239,17 @@ def train() -> None:
     )
 
     # Evaluate the model
-    val_preds = model.predict(X_val).ravel()
-    val_proba = model.predict_proba(X_val)  # Shape: (n_samples, 3) for 3 classes
+    #val_preds = model.predict(X_val).ravel()
+    #val_proba = model.predict_proba(X_val)  # Shape: (n_samples, 3) for 3 classes
 
-    accuracy = accuracy_score(y_val, val_preds)
+    #accuracy = accuracy_score(y_val, val_preds)
     # For multiclass, use average='weighted' or 'macro'
-    precision = precision_score(y_val, val_preds, average="weighted", zero_division=0)
-    recall = recall_score(y_val, val_preds, average="weighted", zero_division=0)
+    #precision = precision_score(y_val, val_preds, average="weighted", zero_division=0)
+    #recall = recall_score(y_val, val_preds, average="weighted", zero_division=0)
 
     # Class distribution
-    class_dist = pd.Series(val_preds).value_counts().sort_index()
-    class_proba_mean = val_proba.mean(axis=0)
+    #class_dist = pd.Series(val_preds).value_counts().sort_index()
+    #class_proba_mean = val_proba.mean(axis=0)
 
     print(f"\nValidation metrics:")
     #print(f"  Accuracy: {accuracy:.4f}")
