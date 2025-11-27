@@ -10,8 +10,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from catboost import CatBoostClassifier, Pool
+import optuna
+import torch
 
 from . import config, constants
 from .evaluate import dcg_at_k, ndcg_at_k
@@ -136,18 +138,66 @@ def train() -> None:
     # Ensure model directory exists
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Train model
-    print("\nTraining CatBoost model (multiclass classification: 3 classes)...")
-    print("  Classes: 0=cold candidates, 1=planned books, 2=read books")
-    params = config.CATBOOST_PARAMS.copy()
-    if 'num_class' in params:
-        del params['num_class']
-    if 'objective' in params:
-        params['loss_function'] = 'MultiClass'
-    model = CatBoostClassifier(**params)
-
+    # Prepare pools for CatBoost
     train_pool = Pool(X_train, y_train, cat_features=categorical_features)
     val_pool = Pool(X_val, y_val, cat_features=categorical_features)
+
+    best_params = config.CATBOOST_PARAMS.copy()
+
+    # Define Optuna objective
+    def objective(trial):
+        params = {
+            "loss_function": "MultiClass",
+            "eval_metric": "TotalF1",
+            "iterations": trial.suggest_int("iterations", 1000, 3000, step=100),  # Around default 2000
+            "learning_rate": trial.suggest_float("learning_rate", 0.001, 0.1, log=True),  # Around default 0.01
+            "depth": trial.suggest_int("depth", 4, 10),  # Around default 6
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True),  # Around default 10.0
+            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.5, 1.5),  # Around default 1.0
+            "random_strength": trial.suggest_float("random_strength", 0.5, 2.0, log=True),  # Around default 1.0
+            "max_bin": trial.suggest_int("max_bin", 100, 300, step=50),  # Around default 254
+            #"rsm": trial.suggest_float("rsm", 0.5, 1.0),  # Around default 0.7 - not for GPU!!!
+            "random_seed": config.RANDOM_STATE,
+            "thread_count": -1,
+            "auto_class_weights": "Balanced",
+            "task_type": "GPU" if torch and torch.cuda.is_available() else "CPU",
+            "devices": "0" if torch and torch.cuda.is_available() else None,
+        }
+
+        model = CatBoostClassifier(**params)
+        model.fit(
+            train_pool,
+            eval_set=val_pool,
+            early_stopping_rounds=config.EARLY_STOPPING_ROUNDS,
+            verbose=False,
+        )
+
+        val_preds = model.predict(val_pool)
+        return f1_score(y_val, val_preds, average="weighted")
+
+    if config.OPTIM_WITH_OPTUNA:
+        # Run Optuna optimization
+        print("\nStarting Optuna hyperparameter optimization...")
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=50)  # Adjust n_trials as needed
+
+        print("\nBest hyperparameters found:")
+        print(study.best_params)
+        print(f"Best F1 score: {study.best_value:.4f}")
+
+        # Update parameters with best found
+        best_params = config.CATBOOST_PARAMS.copy()
+        best_params.update(study.best_params)
+
+
+    # Train final model with best parameters
+    print("\nTraining final CatBoost model with final hyperparameters...")
+    print("  Classes: 0=cold candidates, 1=planned books, 2=read books")
+    if 'num_class' in best_params:
+        del best_params['num_class']
+    if 'objective' in best_params:
+        best_params['loss_function'] = 'MultiClass'
+    model = CatBoostClassifier(**best_params)
 
     model.fit(
         train_pool,
@@ -187,6 +237,11 @@ def train() -> None:
     with open(config.MODEL_DIR / "features_list.json", "w") as f:
         json.dump(features, f)
     print(f"Feature list saved → {config.MODEL_DIR / 'features_list.json'}")
+
+    # Save best parameters
+    with open(config.MODEL_DIR / "best_params.json", "w") as f:
+        json.dump(best_params, f)
+    print(f"Best parameters saved → {config.MODEL_DIR / 'best_params.json'}")
 
     print("\nTraining completed successfully.")
 
