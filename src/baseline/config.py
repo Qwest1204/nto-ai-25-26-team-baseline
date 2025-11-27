@@ -75,8 +75,8 @@ CAT_FEATURES = [
 
 
 CATBOOST_PARAMS = {
-    "loss_function": "MultiClass",
-    "eval_metric": "TotalF1",
+    #"loss_function": "MultiClass",
+    #"eval_metric": "TotalF1",
     "iterations": 2000,
     "learning_rate": 0.01,
     "depth": 6,
