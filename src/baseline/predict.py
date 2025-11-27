@@ -263,26 +263,15 @@ def predict() -> None:
     # p1 = probability of class 1 (planned books)
     # p2 = probability of class 2 (read books)
     print("Generating predictions...")
-    test_pool = Pool(X_test, cat_features=categorical_features)
-    test_proba_all = model.predict_proba(test_pool)  # Returns probabilities for all classes
+    test_pool = Pool(
+        data=X_test,
+        group_id=candidates_final[constants.COL_USER_ID],  # обязательно!
+        cat_features=categorical_features
+    )
+    rank_scores = model.predict(test_pool)  # Returns probabilities for all classes
     # Convert to numpy array if needed and ensure it's 2D array: (n_samples, num_classes)
-    test_proba_all = np.array(test_proba_all)
-    if test_proba_all.ndim == 1:
-        # If it's 1D, reshape to (n_samples, num_classes)
-        test_proba_all = test_proba_all.reshape(-1, test_proba_all.shape[0] // X_test.shape[0])
-
-    # Calculate ranking score adaptively based on number of classes
-    num_classes = test_proba_all.shape[1]
-    if num_classes == 3:
-        test_proba = test_proba_all[:, 1] * 1.0 + test_proba_all[:, 2] * 2.0
-    elif num_classes == 2:
-        # Assume classes 0 and 1 (cold and planned), ignore read
-        test_proba = test_proba_all[:, 1] * 1.0
-    else:
-        raise ValueError(f"Unexpected number of classes: {num_classes}")
-
     # Add predictions to candidates dataframe
-    candidates_final["prediction"] = test_proba
+    candidates_final["prediction"] = rank_scores
 
     # Rank candidates for each user and select top-K
     print("\nRanking candidates for each user...")

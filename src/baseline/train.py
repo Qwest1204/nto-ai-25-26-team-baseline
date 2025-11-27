@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from catboost import CatBoostClassifier, Pool
+from catboost import CatBoostRanker, Pool
 import optuna
 import torch
 
@@ -20,6 +20,17 @@ from .evaluate import dcg_at_k, ndcg_at_k
 from .features import add_aggregate_features, handle_missing_values
 from .temporal_split import get_split_date_from_ratio, temporal_split_by_date
 
+def calculate_ndcg_val(model, val_pool, val_df, k=20):
+    preds = model.predict(val_pool)
+    val_df = val_df.copy()
+    val_df["pred"] = preds
+
+    ndcgs = []
+    for user_id, group in val_df.groupby(constants.COL_USER_ID):
+        group = group.sort_values("pred", ascending=False)
+        relevance = group[config.TARGET].tolist()           # 0, 1, 2
+        ndcgs.append(ndcg_at_k(relevance, k=k))
+    return np.mean(ndcgs)
 
 
 def train() -> None:
@@ -95,8 +106,16 @@ def train() -> None:
 
     # Handle missing values (use train_split for fill values)
     print("Handling missing values...")
+
     train_split_final = handle_missing_values(train_split_with_agg, train_split)
     val_split_final = handle_missing_values(val_split_with_agg, train_split)
+
+    train_split_final["group_id"] = train_split_final[constants.COL_USER_ID]
+    val_split_final["group_id"] = val_split_final[constants.COL_USER_ID]
+
+    print("Sorting train and validation splits by group_id (user_id)...")
+    train_split_final = train_split_final.sort_values("group_id").reset_index(drop=True)
+    val_split_final = val_split_final.sort_values("group_id").reset_index(drop=True)
 
     # Define features (X) and target (y)
     # Exclude timestamp, source, target, prediction columns
@@ -105,6 +124,7 @@ def train() -> None:
         config.TARGET,
         constants.COL_PREDICTION,
         constants.COL_TIMESTAMP,
+        "group_id",  # ← тоже исключаем!
     ]
     features = [col for col in train_split_final.columns if col not in exclude_cols]
 
@@ -113,9 +133,10 @@ def train() -> None:
     features = [f for f in features if f not in non_feature_object_cols]
 
     X_train = train_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
-    y_train = train_split_final[config.TARGET]#.replace({1:0, 2:1})
+    y_train = train_split_final[config.TARGET].replace({1:0, 2:1})
     X_val = val_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
-    y_val = val_split_final[config.TARGET]#.replace({1:0, 2:1})
+    y_val = val_split_final[config.TARGET].replace({1:0, 2:1})
+
     # Optimize memory usage: convert float64 to float32 (reduces memory by ~50%)
     print("Optimizing data types for memory efficiency...")
     float64_cols = X_train.select_dtypes(include=["float64"]).columns
@@ -139,16 +160,27 @@ def train() -> None:
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     # Prepare pools for CatBoost
-    train_pool = Pool(X_train, y_train, cat_features=categorical_features)
-    val_pool = Pool(X_val, y_val, cat_features=categorical_features)
+    train_pool = Pool(
+        data=X_train,
+        label=y_train,  # 0, 1, 2 — уровни релевантности
+        group_id=train_split_final["group_id"],
+        cat_features=categorical_features
+    )
+    val_pool = Pool(
+        data=X_val,
+        label=y_val,
+        group_id=val_split_final["group_id"],
+        cat_features=categorical_features
+    )
 
     best_params = config.CATBOOST_PARAMS.copy()
 
     # Define Optuna objective
     def objective(trial):
         params = {
-            "loss_function": "MultiClass",
-            "eval_metric": "TotalF1",
+            "loss_function": "YetiRank",
+            "custom_metric": ["NDCG:top=20", "PFound"],
+            "eval_metric": "NDCG:top=20",
             "iterations": trial.suggest_int("iterations", 1000, 3000, step=100),  # Around default 2000
             "learning_rate": trial.suggest_float("learning_rate", 0.001, 0.1, log=True),  # Around default 0.01
             "depth": trial.suggest_int("depth", 4, 10),  # Around default 6
@@ -159,12 +191,12 @@ def train() -> None:
             #"rsm": trial.suggest_float("rsm", 0.5, 1.0),  # Around default 0.7 - not for GPU!!!
             "random_seed": config.RANDOM_STATE,
             "thread_count": -1,
-            "auto_class_weights": "Balanced",
+            #"auto_class_weights": "Balanced",
             "task_type": "GPU" if torch and torch.cuda.is_available() else "CPU",
             "devices": "0" if torch and torch.cuda.is_available() else None,
         }
 
-        model = CatBoostClassifier(**params)
+        model = CatBoostRanker(**params)
         model.fit(
             train_pool,
             eval_set=val_pool,
@@ -172,8 +204,8 @@ def train() -> None:
             verbose=False,
         )
 
-        val_preds = model.predict(val_pool)
-        return f1_score(y_val, val_preds, average="weighted")
+        #val_preds = model.predict(val_pool)
+        return calculate_ndcg_val(model, val_pool, val_split_final, k=20)
 
     if config.OPTIM_WITH_OPTUNA:
         # Run Optuna optimization
@@ -197,7 +229,7 @@ def train() -> None:
         del best_params['num_class']
     if 'objective' in best_params:
         best_params['loss_function'] = 'MultiClass'
-    model = CatBoostClassifier(**best_params)
+    model = CatBoostRanker(**best_params)
 
     model.fit(
         train_pool,
@@ -220,14 +252,16 @@ def train() -> None:
     class_proba_mean = val_proba.mean(axis=0)
 
     print(f"\nValidation metrics:")
-    print(f"  Accuracy: {accuracy:.4f}")
-    print(f"  Precision (weighted): {precision:.4f}")
-    print(f"  Recall (weighted): {recall:.4f}")
-    print(f"  Predicted class distribution:")
-    for class_idx in range(val_proba.shape[1]):
-        count = class_dist.get(class_idx, 0)
-        proba_mean = class_proba_mean[class_idx]
-        print(f"    Class {class_idx}: {count} samples ({100*count/len(val_preds):.1f}%), mean proba: {proba_mean:.4f}")
+    #print(f"  Accuracy: {accuracy:.4f}")
+    val_ndcg = calculate_ndcg_val(model, val_pool, val_split_final)
+    print(f"Validation NDCG@20 = {val_ndcg:.5f}")
+    #print(f"  Precision (weighted): {precision:.4f}")
+    #print(f"  Recall (weighted): {recall:.4f}")
+    #print(f"  Predicted class distribution:")
+    #for class_idx in range(val_proba.shape[1]):
+    #    count = class_dist.get(class_idx, 0)
+    #    proba_mean = class_proba_mean[class_idx]
+    #    print(f"    Class {class_idx}: {count} samples ({100*count/len(val_preds):.1f}%), mean proba: {proba_mean:.4f}")
 
     # Save the trained model
     model_path = config.MODEL_DIR / config.MODEL_FILENAME
