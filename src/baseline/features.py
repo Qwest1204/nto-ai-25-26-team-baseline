@@ -187,41 +187,6 @@ def add_text_features(df: pd.DataFrame, train_df: pd.DataFrame, descriptions_df:
     print(f"Added {len(tfidf_feature_names)} TF-IDF features.")
     return df_with_tfidf
 
-def compress_embedding_pca(embeddings_dict: dict, n_components: int, train_book_ids: set) -> dict:
-    """
-    Compresses embeddings using PCA, fitting on training data only.
-
-    Args:
-        embeddings_dict (dict): Dictionary of book_id to embedding vectors.
-        n_components (int): Number of principal components to retain.
-        train_book_ids (set): Set of book_ids from the training data.
-
-    Returns:
-        dict: Dictionary of book_id to compressed embedding vectors.
-    """
-    scaler = StandardScaler()
-    pca = PCA(n_components=n_components)
-
-    # Extract training embeddings
-    train_embeddings = np.array([embeddings_dict[bid] for bid in train_book_ids if bid in embeddings_dict])
-
-    # Fit scaler and PCA on training embeddings
-    if len(train_embeddings) > 0:
-        train_scaled = scaler.fit_transform(train_embeddings)
-        pca.fit(train_scaled)
-    else:
-        raise ValueError("No training embeddings available for PCA fitting.")
-
-    # Transform all embeddings
-    keys = list(embeddings_dict.keys())
-    all_embeddings = np.array(list(embeddings_dict.values()))
-    all_scaled = scaler.transform(all_embeddings)
-    pca_result = pca.transform(all_scaled)
-
-    # Reconstruct compressed dictionary
-    compressed_dict = {key: pca_result[i] for i, key in enumerate(keys)}
-    print(f"Successfully compressed embeddings to {n_components}")
-    return compressed_dict
 
 def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
     """Adds BERT embeddings from book descriptions.
@@ -458,9 +423,6 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
 
     # Get train book ids for PCA fitting
     train_book_ids = set(_train_df[constants.COL_BOOK_ID].unique())
-
-    # Compress embeddings using PCA
-    embeddings_dict = compress_embedding_pca(embeddings_dict, n_components, train_book_ids)
 
     # Map embeddings to DataFrame rows by book_id
     df_book_ids = df[constants.COL_BOOK_ID].to_numpy()
