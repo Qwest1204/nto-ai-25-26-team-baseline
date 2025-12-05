@@ -13,7 +13,7 @@ from catboost import CatBoostClassifier, Pool
 
 from . import config, constants
 from .data_processing import expand_candidates, load_and_merge_data
-from .features import add_aggregate_features, handle_missing_values
+from .features import add_aggregate_features, handle_missing_values, add_temporal_features
 
 
 def predict() -> None:
@@ -137,6 +137,9 @@ def predict() -> None:
     # Compute aggregate features on ALL train data
     print("\nComputing aggregate features on all train data...")
     candidates_with_agg = add_aggregate_features(candidates_with_meta.copy(), train_df)
+
+    print("\nComputing temporal features on all train data...")
+    candidates_with_agg = add_temporal_features(candidates_with_agg, train_df)
 
     # Handle missing values
     print("Handling missing values...")

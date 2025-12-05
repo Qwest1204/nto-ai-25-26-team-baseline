@@ -12,12 +12,83 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-
 from . import config, constants
 
+def add_temporal_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds temporal features based on timestamps from train_df to prevent leakage.
+
+    Features:
+    - user_last_interaction_delta: Days since user's last interaction (log-normalized).
+    - user_interaction_frequency: Interactions per day for the user.
+    - interaction_month_sin/interaction_month_cos: Cyclical encoding for seasonality (month).
+
+    Args:
+        df: Main DataFrame to add features to.
+        train_df: Training split for computing aggregations.
+
+    Returns:
+        pd.DataFrame with new temporal features.
+    """
+    print("Adding temporal features...")
+
+    # Ensure timestamp is datetime
+    train_df[constants.COL_TIMESTAMP] = pd.to_datetime(train_df[constants.COL_TIMESTAMP])
+
+    # Compute global max timestamp from train_df for deltas
+    global_max_ts = train_df[constants.COL_TIMESTAMP].max()
+
+    # User-level aggregations from train_df only
+    user_temporal_agg = train_df.groupby(constants.COL_USER_ID)[constants.COL_TIMESTAMP].agg(
+        ['max', 'min', 'count']
+    ).reset_index()
+    user_temporal_agg.columns = [
+        constants.COL_USER_ID,
+        'user_last_ts',
+        'user_first_ts',
+        'user_interaction_count'
+    ]
+
+    # Feature 1.1: Time since last interaction (days, log-normalized)
+    user_temporal_agg['user_last_interaction_delta'] = (
+        (global_max_ts - user_temporal_agg['user_last_ts']).dt.days
+    ).clip(lower=0)  # Avoid negatives
+    user_temporal_agg['user_last_interaction_delta'] = np.log1p(
+        user_temporal_agg['user_last_interaction_delta']
+    )  # Log for skewness
+
+    # Feature 1.2: Interaction frequency (interactions per day)
+    user_temporal_agg['interaction_duration_days'] = (
+        (user_temporal_agg['user_last_ts'] - user_temporal_agg['user_first_ts']).dt.days + 1
+    ).clip(lower=1)  # Avoid division by zero
+    user_temporal_agg['user_interaction_frequency'] = (
+        user_temporal_agg['user_interaction_count'] / user_temporal_agg['interaction_duration_days']
+    )
+
+    # Feature 1.3: Seasonal (month) cyclical encoding (sin/cos for periodicity)
+    # Use mean month from user's interactions
+    train_df['interaction_month'] = train_df[constants.COL_TIMESTAMP].dt.month
+    user_month_agg = train_df.groupby(constants.COL_USER_ID)['interaction_month'].mean().reset_index()
+    user_month_agg['interaction_month_sin'] = np.sin(2 * np.pi * user_month_agg['interaction_month'] / 12)
+    user_month_agg['interaction_month_cos'] = np.cos(2 * np.pi * user_month_agg['interaction_month'] / 12)
+    # Merge back (dropping temporary column)
+    user_temporal_agg = user_temporal_agg.merge(
+        user_month_agg[[constants.COL_USER_ID, 'interaction_month_sin', 'interaction_month_cos']],
+        on=constants.COL_USER_ID, how='left'
+    )
+
+    # Merge selected features into df (drop intermediate columns)
+    temporal_features = [
+        constants.COL_USER_ID,
+        'user_last_interaction_delta',
+        'user_interaction_frequency',
+        'interaction_month_sin',
+        'interaction_month_cos'
+    ]
+    df = df.merge(user_temporal_agg[temporal_features], on=constants.COL_USER_ID, how='left')
+
+    print(f"  - Added temporal features for {len(df):,} rows")
+    return df
 
 def add_interaction_feature(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
     """Adds binary interaction feature indicating if (user_id, book_id) pair exists in train data.
@@ -468,6 +539,18 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
     # For has_read, this is the proportion of read books
     global_mean = train_df[config.TARGET].mean()
 
+    global_delta_median = train_df.groupby(constants.COL_USER_ID)[constants.COL_TIMESTAMP].max().apply(
+        lambda x: (train_df[constants.COL_TIMESTAMP].max() - x).days).median()
+    df['user_last_interaction_delta'] = df['user_last_interaction_delta'].fillna(np.log1p(global_delta_median))
+
+    global_freq_mean = (train_df.groupby(constants.COL_USER_ID).size() / (train_df.groupby(constants.COL_USER_ID)[constants.COL_TIMESTAMP].apply(lambda x: (x.max() - x.min()).days + 1).clip(lower=1))
+                         ).mean()
+
+    df['user_interaction_frequency'] = df['user_interaction_frequency'].fillna(global_freq_mean)
+
+    # For seasonal: fill with 0 (neutral in sin/cos)
+    df['interaction_month_sin'] = df['interaction_month_sin'].fillna(0.0)
+    df['interaction_month_cos'] = df['interaction_month_cos'].fillna(0.0)
     # Fill age with the median
     age_median = df[constants.COL_AGE].median()
     df[constants.COL_AGE] = df[constants.COL_AGE].fillna(age_median)

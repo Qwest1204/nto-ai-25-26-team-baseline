@@ -17,7 +17,7 @@ import torch
 
 from . import config, constants
 from .evaluate import dcg_at_k, ndcg_at_k
-from .features import add_aggregate_features, handle_missing_values
+from .features import add_aggregate_features, handle_missing_values, add_temporal_features
 from .temporal_split import get_split_date_from_ratio, temporal_split_by_date
 
 
@@ -92,6 +92,10 @@ def train() -> None:
     print("\nComputing aggregate features on train split only...")
     train_split_with_agg = add_aggregate_features(train_split.copy(), train_split)
     val_split_with_agg = add_aggregate_features(val_split.copy(), train_split)  # Use train_split for aggregates!
+
+    print("\nComputing temporal features on train split only...")
+    train_split_with_agg = add_temporal_features(train_split_with_agg, train_split)
+    val_split_with_agg = add_temporal_features(val_split_with_agg, train_split)
 
     # Handle missing values (use train_split for fill values)
     print("Handling missing values...")
