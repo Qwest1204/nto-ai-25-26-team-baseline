@@ -60,9 +60,6 @@ NOMIC_EMBEDDING_DIM = 768
 NOMIC_DEVICE = "cuda" if torch and torch.cuda.is_available() else "cpu"
 NOMIC_GPU_MEMORY_FRACTION = 0.75
 
-# --- PCA ---
-PCA_NUM_COMPONENTS = 100
-
 # --- FEATURES ---
 CAT_FEATURES = [
     constants.COL_USER_ID,
