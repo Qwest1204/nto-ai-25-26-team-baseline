@@ -176,6 +176,7 @@ def predict() -> None:
         errors="ignore"
     )
 
+
     # Add missing features with default values
     missing_features = [f for f in features if f not in candidates_final.columns]
     if missing_features:
