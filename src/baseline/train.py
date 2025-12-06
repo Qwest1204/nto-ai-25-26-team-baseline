@@ -69,40 +69,29 @@ def train_2stage():
             train_df[col] = train_df[col].astype('category')
             val_df[col] = val_df[col].astype('category')
 
+    # Сортируем данные по user_id для CatBoost Ranker
+    print("Sorting data by user_id for CatBoost Ranker...")
+    train_df = train_df.sort_values(by=constants.COL_USER_ID).reset_index(drop=True)
+    val_df = val_df.sort_values(by=constants.COL_USER_ID).reset_index(drop=True)
+
     X_train = train_df[features]
     X_val = val_df[features]
     y_train = train_df[constants.COL_RELEVANCE]
     y_val = val_df[constants.COL_RELEVANCE]
 
-    # Проверим, что нет строковых значений в данных
-    print("Checking for non-numeric values in features...")
-    for col in features:
-        if train_df[col].dtype.name not in ['category', 'bool']:
-            # Проверим на наличие нечисловых значений
-            try:
-                # Пробуем преобразовать в float
-                _ = train_df[col].astype(float)
-            except Exception as e:
-                print(f"Error in column {col}: {e}")
-                print(f"Unique values in {col}: {train_df[col].unique()[:10]}")
-
-    # Преобразуем bool в int для CatBoost
-    for col in features:
-        if train_df[col].dtype.name == 'bool':
-            train_df[col] = train_df[col].astype(int)
-            val_df[col] = val_df[col].astype(int)
-
-    # Обновляем X_train и X_val после преобразований
-    X_train = train_df[features]
-    X_val = val_df[features]
-
-    groups_train = train_df.groupby(constants.COL_USER_ID).size().values
-    groups_val = val_df.groupby(constants.COL_USER_ID).size().values
+    # Для CatBoost Ranker нам нужен массив group_id, где для каждой строки указан group_id
+    train_group_ids = train_df[constants.COL_USER_ID].values
+    val_group_ids = val_df[constants.COL_USER_ID].values
 
     cat_features = [i for i, c in enumerate(features) if X_train[c].dtype.name == 'category']
 
     print(f"Number of categorical features: {len(cat_features)}")
     print(f"Categorical feature indices: {cat_features}")
+    print(f"Categorical feature names: {[features[i] for i in cat_features]}")
+
+    # Проверим размеры групп
+    print(f"Train groups: {len(np.unique(train_group_ids))} users, {len(train_df)} rows")
+    print(f"Val groups: {len(np.unique(val_group_ids))} users, {len(val_df)} rows")
 
     # === 4. Stage 1: CatBoostRanker ===
     print("Training Stage 1: CatBoostRanker...")
@@ -117,8 +106,26 @@ def train_2stage():
         X_train_cb[col] = X_train_cb[col].astype(str).fillna('nan')
         X_val_cb[col] = X_val_cb[col].astype(str).fillna('nan')
 
-    cb_pool_train = Pool(X_train_cb, y_train, group_id=train_df[constants.COL_USER_ID], cat_features=cat_features)
-    cb_pool_val = Pool(X_val_cb, y_val, group_id=val_df[constants.COL_USER_ID], cat_features=cat_features)
+    # Создаем Pool для CatBoost Ranker
+    print("Creating CatBoost Pool...")
+
+    try:
+        cb_pool_train = Pool(
+            data=X_train_cb,
+            label=y_train,
+            group_id=train_group_ids,
+            cat_features=cat_features
+        )
+
+        cb_pool_val = Pool(
+            data=X_val_cb,
+            label=y_val,
+            group_id=val_group_ids,
+            cat_features=cat_features
+        )
+    except Exception as e:
+        print(f"Error creating CatBoost Pool: {e}")
+        raise
 
     cb_model = CatBoostRanker(
         iterations=2500,
@@ -131,30 +138,18 @@ def train_2stage():
         verbose=200,
     )
 
-    try:
-        cb_model.fit(cb_pool_train, eval_set=cb_pool_val, early_stopping_rounds=100)
-    except Exception as e:
-        print(f"Error fitting CatBoost: {e}")
-        # Выведем больше информации о данных
-        print("Data types in X_train_cb:")
-        print(X_train_cb.dtypes.value_counts())
-        print("\nSample of X_train_cb:")
-        print(X_train_cb.head())
-        raise
+    print("Fitting CatBoost Ranker...")
+    cb_model.fit(cb_pool_train, eval_set=cb_pool_val, early_stopping_rounds=100)
 
     score1_train = cb_model.predict(cb_pool_train)
     score1_val = cb_model.predict(cb_pool_val)
 
     # Сохраняем Stage 1
     cb_model.save_model(str(config.MODEL_DIR / "stage1_catboost.cbm"))
+    print("Stage 1 model saved.")
 
-    # === 5. Stage 2: LightGBM на остатках ===
-    print("Training Stage 2: LightGBM on residuals...")
-
-    # Остатки: relevance - λ × score1
-    lambda_residual = 0.8
-    residual_train = y_train.values - lambda_residual * score1_train
-    residual_val = y_val.values - lambda_residual * score1_val
+    # === 5. Stage 2: LightGBM с фичей из Stage 1 ===
+    print("Training Stage 2: LightGBM with Stage 1 predictions as feature...")
 
     # Добавляем score1 как главную фичу
     X_train2 = X_train.copy()
@@ -169,8 +164,37 @@ def train_2stage():
             X_train2[col] = X_train2[col].cat.codes
             X_val2[col] = X_val2[col].cat.codes
 
-    lgb_train = lgb.Dataset(X_train2, label=residual_train, group=groups_train)
-    lgb_val = lgb.Dataset(X_val2, label=residual_val, group=groups_val, reference=lgb_train)
+    # Для LightGBM LambdaRank метки должны быть целыми числами
+    # У нас метки relevance: 0, 1, 2 - это уже целые числа
+    lgb_y_train = y_train.values
+    lgb_y_val = y_val.values
+
+    # Для LightGBM нам также нужны группы
+    # LightGBM использует параметр group, который содержит размеры групп
+    train_group_sizes = train_df.groupby(constants.COL_USER_ID).size().values
+    val_group_sizes = val_df.groupby(constants.COL_USER_ID).size().values
+
+    # Проверяем типы данных
+    print(f"X_train2 dtypes: {X_train2.dtypes.unique()}")
+    print(f"y_train dtype: {lgb_y_train.dtype}")
+
+    # Убедимся, что все данные имеют правильный тип
+    X_train2 = X_train2.astype(float)
+    X_val2 = X_val2.astype(float)
+    lgb_y_train = lgb_y_train.astype(int)
+    lgb_y_val = lgb_y_val.astype(int)
+
+    lgb_train = lgb.Dataset(
+        X_train2,
+        label=lgb_y_train,
+        group=train_group_sizes
+    )
+    lgb_val = lgb.Dataset(
+        X_val2,
+        label=lgb_y_val,
+        group=val_group_sizes,
+        reference=lgb_train
+    )
 
     lgb_params = {
         'objective': 'lambdarank',
@@ -186,19 +210,21 @@ def train_2stage():
         'lambda_l2': 10,
     }
 
+    print("Training LightGBM model...")
     lgb_model = lgb.train(
         lgb_params,
         lgb_train,
         num_boost_round=3000,
         valid_sets=[lgb_val],
         callbacks=[lgb.early_stopping(150)],
-        verbose_eval=100,
+        #verbose_eval=100,
     )
 
     lgb_model.save_model(str(config.MODEL_DIR / "stage2_lightgbm.txt"))
+    print("Stage 2 model saved.")
 
     # === 6. Финальный скор ===
-    final_pred_val = score1_val + lgb_model.predict(X_val2)
+    final_pred_val = lgb_model.predict(X_val2)
 
     # Оценка
     from .evaluate import ndcg_at_k

@@ -1,15 +1,15 @@
 """
-Inference script to generate predictions for the test set.
+Inference script to generate predictions for the test set using 2-stage model.
 
-Computes aggregate features on all train data and applies them to test set,
-then generates predictions using the trained model and ranks candidates for each user.
+Stage 1: CatBoostRanker
+Stage 2: LightGBM with Stage 1 predictions as feature
 """
 
 import json
 import numpy as np
 import pandas as pd
-
-from catboost import CatBoostClassifier, Pool
+import lightgbm as lgb
+from catboost import CatBoostRanker, Pool
 
 from . import config, constants
 from .data_processing import expand_candidates, load_and_merge_data
@@ -17,20 +17,20 @@ from .features import add_aggregate_features, handle_missing_values, add_tempora
 
 
 def predict() -> None:
-    """Generates and saves ranked predictions for the test set.
+    """Generates and saves ranked predictions for the test set using 2-stage model.
 
     This script:
     1. Loads targets.csv and candidates.csv
     2. Expands candidates into (user_id, book_id) pairs
-    3. Computes aggregate features on all train data
-    4. Generates probabilities for 3 classes using the trained multiclass model
-       (class 0=cold, 1=planned, 2=read)
-    5. Calculates ranking score: p1*1 + p2*2 (weighted sum based on relevance)
-    6. Ranks candidates for each user and selects top-K (K = min(20, num_candidates))
-    7. Saves submission.csv in format: user_id,book_id_list
+    3. Computes features on all train data
+    4. Generates Stage 1 predictions using CatBoostRanker
+    5. Adds Stage 1 predictions as feature for Stage 2
+    6. Generates final predictions using LightGBM
+    7. Ranks candidates for each user and selects top-K (K = min(20, num_candidates))
+    8. Saves submission.csv in format: user_id,book_id_list
 
     Note: Data must be prepared first using prepare_data.py, and model must be trained
-    using train.py
+    using train.py (train_2stage function)
     """
     # Load targets and candidates
     print("Loading targets and candidates...")
@@ -100,24 +100,24 @@ def predict() -> None:
         col
         for col in featured_df.columns
         if col
-           not in [
-               constants.COL_USER_ID,
-               constants.COL_BOOK_ID,
-               constants.COL_SOURCE,
-               constants.COL_TIMESTAMP,
-               constants.COL_HAS_READ,
-               constants.COL_TARGET,
-               constants.COL_PREDICTION,
-               constants.COL_GENDER,
-               constants.COL_AGE,
-               constants.COL_AUTHOR_ID,
-               constants.COL_PUBLICATION_YEAR,
-               constants.COL_LANGUAGE,
-               constants.COL_PUBLISHER,
-               constants.COL_AVG_RATING,
-           ]
-           and not col.startswith("tfidf_")
-           and not col.startswith("bert_")
+        not in [
+            constants.COL_USER_ID,
+            constants.COL_BOOK_ID,
+            constants.COL_SOURCE,
+            constants.COL_TIMESTAMP,
+            constants.COL_HAS_READ,
+            constants.COL_TARGET,
+            constants.COL_PREDICTION,
+            constants.COL_GENDER,
+            constants.COL_AGE,
+            constants.COL_AUTHOR_ID,
+            constants.COL_PUBLICATION_YEAR,
+            constants.COL_LANGUAGE,
+            constants.COL_PUBLISHER,
+            constants.COL_AVG_RATING,
+        ]
+        and not col.startswith("tfidf_")
+        and not col.startswith("bert_")
     ]
 
     # Add genre count and text features
@@ -162,38 +162,26 @@ def predict() -> None:
     if features_path.exists():
         print("Loading feature list from training...")
         with open(features_path, "r") as f:
-            features = json.load(f)
-        print(f"Loaded {len(features)} features from training")
-    else:
-        # Fallback: use same logic as training
-        print("Warning: Feature list not found, using fallback logic")
-        exclude_cols = [
-            constants.COL_SOURCE,
-            config.TARGET,
-            constants.COL_PREDICTION,
-            constants.COL_TIMESTAMP,
-        ]
-        train_features = [col for col in train_df.columns if col not in exclude_cols]
-        train_non_feature_object_cols = train_df[train_features].select_dtypes(include=["object"]).columns.tolist()
-        features = [f for f in train_features if f not in train_non_feature_object_cols]
+            features2 = json.load(f)  # features with score_stage1
+        print(f"Loaded {len(features2)} features from training")
 
-    # Remove any columns that shouldn't be features (like title, author_name, etc.)
-    exclude_cols = [
-        constants.COL_SOURCE,
-        config.TARGET,
-        constants.COL_PREDICTION,
-        constants.COL_TIMESTAMP,
-        constants.COL_USER_ID,
-        constants.COL_BOOK_ID,
-    ]
-    candidates_final = candidates_final.drop(
-        columns=[col for col in candidates_final.columns if
-                 col not in features and col not in exclude_cols + [constants.COL_USER_ID, constants.COL_BOOK_ID]],
-        errors="ignore"
-    )
+        # For Stage 1 (CatBoostRanker), use features without score_stage1
+        features = [f for f in features2 if f != 'score_stage1']
+        print(f"Features for Stage 1 (CatBoostRanker): {len(features)}")
+        print(f"Features for Stage 2 (LightGBM): {len(features2)}")
+    else:
+        raise FileNotFoundError(
+            f"Feature list not found at {features_path}. "
+            "Please run 'poetry run python -m src.baseline.train' first."
+        )
+
+    # Prepare data for prediction
+    # Keep only needed columns
+    all_needed_cols = list(set(features2 + [constants.COL_USER_ID, constants.COL_BOOK_ID]))
+    candidates_final = candidates_final[[col for col in all_needed_cols if col in candidates_final.columns]]
 
     # Add missing features with default values
-    missing_features = [f for f in features if f not in candidates_final.columns]
+    missing_features = [f for f in features2 if f not in candidates_final.columns]
     if missing_features:
         print(f"Warning: Missing {len(missing_features)} features in candidates, adding defaults")
         for feat in missing_features:
@@ -207,106 +195,88 @@ def predict() -> None:
             else:
                 candidates_final[feat] = 0
 
-    # Ensure all features exist in candidates_final (add missing ones)
-    # features list is from training, so we need all of them
-    for feat in features:
+    # Ensure all features exist in candidates_final
+    for feat in features2:
         if feat not in candidates_final.columns:
-            # Add with default value
-            if feat in train_df.columns:
-                if train_df[feat].dtype.name == "category":
-                    default_val = train_df[feat].cat.categories[0] if len(train_df[feat].cat.categories) > 0 else 0
-                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final),
-                                                            categories=train_df[feat].cat.categories, ordered=False)
-                else:
-                    candidates_final[feat] = train_df[feat].iloc[0] if len(train_df) > 0 else 0
-            else:
-                candidates_final[feat] = 0
+            candidates_final[feat] = 0
 
-    # Final check: ensure we have all features in the exact order
-    features = [f for f in features if f in candidates_final.columns]
+    # === STAGE 1: CatBoostRanker ===
+    print("\n=== Stage 1: CatBoostRanker ===")
 
-    # Convert categorical columns to pandas 'category' dtype for CatBoost (same as in train.py)
-    # Use categories from featured_df (processed data) to ensure they match training data
-    # This is critical: CatBoost requires exact match of categorical features
-    # Only process columns that were actually categorical in training data
-    for col in features:
-        if col in featured_df.columns and featured_df[col].dtype.name == "category":
-            # Get categories from processed training data
-            train_categories = list(featured_df[col].cat.categories)
+    # Prepare data for CatBoost
+    X_test_stage1 = candidates_final[features].copy()
 
-            # Convert to string first to handle any type mismatches
-            candidates_final[col] = candidates_final[col].astype(str)
+    # Identify categorical features for CatBoost
+    categorical_features = [f for f in features if X_test_stage1[f].dtype.name == "category"]
 
-            # Replace any values not in train categories with first train category
-            valid_mask = candidates_final[col].isin([str(cat) for cat in train_categories])
-            if not valid_mask.all():
-                invalid_count = (~valid_mask).sum()
-                print(
-                    f"Warning: {invalid_count} values in {col} not in training categories, replacing with first category")
-                candidates_final.loc[~valid_mask, col] = str(train_categories[0]) if len(train_categories) > 0 else "0"
+    # Convert categorical features to strings for CatBoost
+    for col in categorical_features:
+        X_test_stage1[col] = X_test_stage1[col].astype(str).fillna('nan')
 
-            # Convert categories back to original type and create categorical
-            # Convert train_categories to same type as in training
-            train_cat_values = [str(cat) for cat in train_categories]
-            candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_cat_values, ordered=False)
-
-            # Convert categorical codes back to original type if needed
-            # This ensures the internal representation matches training
-            if len(train_categories) > 0:
-                # Re-map to original category values
-                candidates_final[col] = candidates_final[col].astype(str).map(
-                    {str(cat): cat for cat in train_categories}
-                ).fillna(train_categories[0])
-                candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_categories,
-                                                       ordered=False)
-
-    X_test = candidates_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1, errors="ignore")
-    print(f"Prediction features: {len(X_test.columns)}")  # Updated to use X_test.columns
-
-    # Identify categorical features for CatBoost, similar to training
-    categorical_features = [f for f in X_test.columns if X_test[f].dtype.name == "category"]
-
-    # Load trained model
-    model_path = config.MODEL_DIR / config.MODEL_FILENAME
-    if not model_path.exists():
+    # Load Stage 1 model
+    stage1_model_path = config.MODEL_DIR / "stage1_catboost.cbm"
+    if not stage1_model_path.exists():
         raise FileNotFoundError(
-            f"Model not found at {model_path}. " "Please run 'poetry run python -m src.baseline.train' first."
+            f"Stage 1 model not found at {stage1_model_path}. "
+            "Please run 'poetry run python -m src.baseline.train' first."
         )
 
-    print(f"\nLoading model from {model_path}...")
-    model = CatBoostClassifier().load_model(str(model_path))
+    print(f"Loading Stage 1 model from {stage1_model_path}...")
+    stage1_model = CatBoostRanker()
+    stage1_model.load_model(str(stage1_model_path))
 
-    # Generate probabilities for multiclass (3 classes)
-    # For multiclass, model.predict_proba() returns probabilities for all classes
-    # Shape: (n_samples, 3) with [p0, p1, p2] for each sample
-    # p0 = probability of class 0 (cold candidates)
-    # p1 = probability of class 1 (planned books)
-    # p2 = probability of class 2 (read books)
-    print("Generating predictions...")
-    test_pool = Pool(X_test, cat_features=categorical_features)
-    test_proba_all = model.predict_proba(test_pool)  # Returns probabilities for all classes
-    # Convert to numpy array if needed and ensure it's 2D array: (n_samples, num_classes)
-    test_proba_all = np.array(test_proba_all)
-    if test_proba_all.ndim == 1:
-        # If it's 1D, reshape to (n_samples, num_classes)
-        test_proba_all = test_proba_all.reshape(-1, test_proba_all.shape[0] // X_test.shape[0])
+    # Generate Stage 1 predictions
+    print("Generating Stage 1 predictions...")
+    # Note: CatBoostRanker doesn't need group_id for prediction
+    stage1_predictions = stage1_model.predict(X_test_stage1)
 
-    # Calculate ranking score adaptively based on number of classes
-    num_classes = test_proba_all.shape[1]
-    if num_classes == 3:
-        test_proba = test_proba_all[:, 1] * 1.0 + test_proba_all[:, 2] * 2.0
-    elif num_classes == 2:
-        # Assume classes 0 and 1 (cold and planned), ignore read
-        test_proba = test_proba_all[:, 1] * 1.0
-    else:
-        raise ValueError(f"Unexpected number of classes: {num_classes}")
+    # Add Stage 1 predictions as feature for Stage 2
+    candidates_final['score_stage1'] = stage1_predictions
 
-    # Add predictions to candidates dataframe
-    candidates_final["prediction"] = test_proba
+    # === STAGE 2: LightGBM ===
+    print("\n=== Stage 2: LightGBM ===")
+
+    # Prepare data for LightGBM
+    X_test_stage2 = candidates_final[features2].copy()
+
+    # Convert categorical features to codes for LightGBM
+    for col in features2:
+        if X_test_stage2[col].dtype.name == "category":
+            # Use categories from training data
+            if col in train_df.columns and train_df[col].dtype.name == "category":
+                train_categories = train_df[col].cat.categories
+                X_test_stage2[col] = pd.Categorical(X_test_stage2[col], categories=train_categories).codes
+            else:
+                # If not in training data, convert to codes directly
+                X_test_stage2[col] = X_test_stage2[col].cat.codes
+
+    # Convert all to float
+    X_test_stage2 = X_test_stage2.astype(float)
+
+    # Load Stage 2 model
+    stage2_model_path = config.MODEL_DIR / "stage2_lightgbm.txt"
+    if not stage2_model_path.exists():
+        raise FileNotFoundError(
+            f"Stage 2 model not found at {stage2_model_path}. "
+            "Please run 'poetry run python -m src.baseline.train' first."
+        )
+
+    print(f"Loading Stage 2 model from {stage2_model_path}...")
+    stage2_model = lgb.Booster(model_file=str(stage2_model_path))
+
+    # Generate final predictions
+    print("Generating final predictions...")
+    final_predictions = stage2_model.predict(X_test_stage2)
+
+    # Add final predictions to candidates dataframe
+    candidates_final["prediction"] = final_predictions
 
     # Rank candidates for each user and select top-K
     print("\nRanking candidates for each user...")
     submission_rows = []
+
+    # Sort candidates by user_id for consistency
+    candidates_final = candidates_final.sort_values(by=constants.COL_USER_ID).reset_index(drop=True)
 
     for user_id in targets_df[constants.COL_USER_ID]:
         user_candidates = candidates_final[candidates_final[constants.COL_USER_ID] == user_id].copy()
@@ -315,7 +285,7 @@ def predict() -> None:
             # No candidates for this user - empty list
             book_id_list = ""
         else:
-            # Sort by prediction probability (descending)
+            # Sort by prediction score (descending)
             user_candidates = user_candidates.sort_values("prediction", ascending=False)
 
             # Select top-K, where K = min(20, num_candidates)
@@ -343,8 +313,12 @@ def predict() -> None:
     non_empty = submission_df[submission_df[constants.COL_BOOK_ID_LIST] != ""].shape[0]
     print(f"Users with recommendations: {non_empty}/{len(submission_df)}")
 
+    # Print prediction statistics
+    print(f"\nPrediction statistics:")
+    print(f"  Stage 1 predictions range: [{stage1_predictions.min():.4f}, {stage1_predictions.max():.4f}]")
+    print(f"  Stage 2 predictions range: [{final_predictions.min():.4f}, {final_predictions.max():.4f}]")
+    print(f"  Average prediction score: {final_predictions.mean():.4f}")
 
-if __name__ == "__main__":
-    predict()
+
 if __name__ == "__main__":
     predict()
