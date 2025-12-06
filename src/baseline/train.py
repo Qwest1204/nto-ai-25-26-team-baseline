@@ -95,9 +95,9 @@ def train() -> None:
 
     print("\nComputing temporal features on train split only...")
     train_split_with_agg = add_temporal_features(train_split_with_agg, train_split)
-    val_split_with_agg = add_temporal_features(val_split_with_agg, train_split)
+    val_split_with_agg = add_temporal_features(val_split_with_agg, train_split)  # важно: только train_split!
 
-    # Handle missing values (use train_split for fill values)
+    # Handle missing values
     print("Handling missing values...")
     train_split_final = handle_missing_values(train_split_with_agg, train_split)
     val_split_final = handle_missing_values(val_split_with_agg, train_split)

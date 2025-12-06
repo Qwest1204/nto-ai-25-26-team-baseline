@@ -77,6 +77,8 @@ def predict() -> None:
     book_data_df = book_data_df.drop_duplicates(subset=[constants.COL_BOOK_ID])
     candidates_with_meta = candidates_with_meta.merge(book_data_df, on=constants.COL_BOOK_ID, how="left")
 
+    candidates_with_meta = add_temporal_features(candidates_with_meta, train_df)
+    candidates_with_meta = handle_missing_values(candidates_with_meta, train_df)
     # Add base features from prepared data (genres, text features)
     # We'll match by book_id to get TF-IDF and BERT features
     book_features = featured_df[[constants.COL_BOOK_ID]].drop_duplicates()

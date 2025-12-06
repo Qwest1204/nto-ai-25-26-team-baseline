@@ -76,12 +76,12 @@ CAT_FEATURES = [
 CATBOOST_PARAMS = {
     "loss_function": "MultiClass",
     "eval_metric": "TotalF1",
-    "iterations": 2000,
-    "learning_rate": 0.01,
-    "depth": 6,
-    "l2_leaf_reg": 10.0,
-    "bagging_temperature": 1.0,
-    "random_strength": 1.0,
+    "iterations": 1400,
+    "learning_rate": 0.014313,
+    "depth": 4,
+    "l2_leaf_reg": 4.1573,
+    "bagging_temperature": 0.73,
+    "random_strength": 1.032,
     "max_bin": 254,
     "random_seed": RANDOM_STATE,
     "thread_count": -1,
@@ -102,4 +102,4 @@ CATBOOST_FIT_KWARGS = {
 }
 
 # --- OPTUNA ---
-OPTIM_WITH_OPTUNA = True
+OPTIM_WITH_OPTUNA = False
