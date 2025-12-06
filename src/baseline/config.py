@@ -70,6 +70,10 @@ CAT_FEATURES = [
     constants.COL_PUBLICATION_YEAR,
     constants.COL_LANGUAGE,
     constants.COL_PUBLISHER,
+    'user_preferred_weekday',
+    'time_of_day',
+    'age_group',
+    'current_streak_type',
 ]
 
 

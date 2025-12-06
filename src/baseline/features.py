@@ -796,8 +796,648 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
             elif pd.api.types.is_numeric_dtype(df[col].dtype) and df[col].isna().any():
                 df[col] = df[col].fillna(constants.MISSING_NUM_VALUE)
 
+    new_numeric_features = [
+        'genre_read_match', 'genre_planned_match', 'genre_conversion_match',
+        'read_after_plan_ratio', 'plan_after_read_ratio',
+        'current_streak_length', 'avg_read_streak', 'avg_plan_streak',
+        'author_familiarity', 'author_read_ratio', 'author_read_count',
+        'activity_trend', 'conversion_trend', 'genre_stability',
+        'user_momentum', 'activity_genre_interaction', 'conversion_recency_interaction'
+    ]
+
+    for col in new_numeric_features:
+        if col in df.columns:
+            if col.endswith('_ratio') or col.endswith('_match'):
+                df[col] = df[col].fillna(0.0)
+            else:
+                df[col] = df[col].fillna(df[col].median() if df[col].notna().any() else 0)
+
+    # Новые категориальные фичи
+    new_categorical_features = [
+        'user_preferred_weekday', 'time_of_day', 'age_group'
+    ]
+
+    for col in new_categorical_features:
+        if col in df.columns:
+            df[col] = df[col].astype(str).fillna(constants.MISSING_CAT_VALUE).astype("category")
+
     return df
 
+
+def add_enhanced_temporal_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет расширенные временные фичи с учетом паттернов поведения.
+    """
+    print("Adding enhanced temporal features...")
+
+    train_df = train_df.copy()
+    train_df[constants.COL_TIMESTAMP] = pd.to_datetime(train_df[constants.COL_TIMESTAMP])
+
+    # 1. Активность по дням недели и времени суток
+    train_df['weekday'] = train_df[constants.COL_TIMESTAMP].dt.weekday
+    train_df['hour'] = train_df[constants.COL_TIMESTAMP].dt.hour
+    train_df['is_weekend'] = train_df['weekday'].isin([5, 6]).astype(int)
+    train_df['time_of_day'] = pd.cut(train_df['hour'],
+                                     bins=[0, 6, 12, 18, 24],
+                                     labels=['night', 'morning', 'afternoon', 'evening'])
+
+    # 2. Пользовательские паттерны активности
+    user_time_patterns = train_df.groupby(constants.COL_USER_ID).agg({
+        'weekday': lambda x: x.mode()[0] if len(x.mode()) > 0 else -1,
+        'hour': lambda x: x.mode()[0] if len(x.mode()) > 0 else -1,
+        'is_weekend': 'mean',
+        constants.COL_TIMESTAMP: ['min', 'max', 'count']
+    }).reset_index()
+
+    user_time_patterns.columns = [
+        constants.COL_USER_ID,
+        'user_preferred_weekday',
+        'user_preferred_hour',
+        'user_weekend_activity_ratio',
+        'user_first_activity',
+        'user_last_activity',
+        'user_total_activities'
+    ]
+
+    # 3. Частота активности пользователя (взаимодействий в день)
+    user_time_patterns['user_activity_days'] = (user_time_patterns['user_last_activity'] -
+                                                user_time_patterns['user_first_activity']).dt.days + 1
+    user_time_patterns['user_activity_frequency'] = (
+        user_time_patterns['user_total_activities'] / user_time_patterns['user_activity_days']
+    ).fillna(0)
+
+    # 4. Сезонность активности (по месяцам)
+    train_df['month'] = train_df[constants.COL_TIMESTAMP].dt.month
+    user_monthly_activity = train_df.groupby([constants.COL_USER_ID, 'month']).size().unstack(fill_value=0)
+    user_monthly_activity = user_monthly_activity.div(user_monthly_activity.sum(axis=1), axis=0)
+
+    # Создаем фичи для каждого месяца
+    for month in range(1, 13):
+        col_name = f'user_month_{month}_activity_ratio'
+        if month in user_monthly_activity.columns:
+            user_time_patterns[col_name] = user_time_patterns[constants.COL_USER_ID].map(
+                user_monthly_activity[month]
+            ).fillna(0)
+        else:
+            user_time_patterns[col_name] = 0
+
+    # 5. Временные промежутки между взаимодействиями
+    train_df_sorted = train_df.sort_values([constants.COL_USER_ID, constants.COL_TIMESTAMP])
+    train_df_sorted['time_gap'] = train_df_sorted.groupby(constants.COL_USER_ID)[constants.COL_TIMESTAMP].diff()
+    train_df_sorted['time_gap_hours'] = train_df_sorted['time_gap'].dt.total_seconds() / 3600
+
+    user_gap_stats = train_df_sorted.groupby(constants.COL_USER_ID)['time_gap_hours'].agg([
+        'mean', 'std', 'min', 'max', 'median'
+    ]).reset_index()
+
+    user_gap_stats.columns = [constants.COL_USER_ID] + [
+        f'user_time_gap_{stat}' for stat in ['mean', 'std', 'min', 'max', 'median']
+    ]
+
+    user_time_patterns = user_time_patterns.merge(user_gap_stats, on=constants.COL_USER_ID, how='left')
+
+    # 6. Присоединяем к основному df
+    df = df.merge(user_time_patterns, on=constants.COL_USER_ID, how='left')
+
+    # 7. Время с последней активности пользователя
+    global_max_time = train_df[constants.COL_TIMESTAMP].max()
+    if 'user_last_activity' in df.columns:
+        df['days_since_last_activity'] = (
+            (global_max_time - df['user_last_activity']).dt.total_seconds() / 86400
+        ).fillna(365)  # если нет истории, ставим большой промежуток
+
+    print(f"  → Enhanced temporal features added: {len(user_time_patterns.columns) - 1} new features")
+    return df
+
+
+def add_genre_preference_features(df: pd.DataFrame, train_df: pd.DataFrame,
+                                  book_genres_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет фичи жанровых предпочтений пользователей.
+    """
+    print("Adding genre preference features...")
+
+    # Объединяем train с жанрами
+    train_with_genres = train_df.merge(
+        book_genres_df,
+        on=constants.COL_BOOK_ID,
+        how='left'
+    )
+
+    # 1. Топ жанры пользователя (по прочитанным)
+    user_genre_read = train_with_genres[train_with_genres[constants.COL_HAS_READ] == 1] \
+        .groupby([constants.COL_USER_ID, constants.COL_GENRE_ID]).size().unstack(fill_value=0)
+    user_genre_read_norm = user_genre_read.div(user_genre_read.sum(axis=1), axis=0).fillna(0)
+
+    # 2. Топ жанры пользователя (по планам)
+    user_genre_planned = train_with_genres[train_with_genres[constants.COL_HAS_READ] == 0] \
+        .groupby([constants.COL_USER_ID, constants.COL_GENRE_ID]).size().unstack(fill_value=0)
+    user_genre_planned_norm = user_genre_planned.div(user_genre_planned.sum(axis=1), axis=0).fillna(0)
+
+    # 3. Конверсия по жанрам
+    user_genre_total = train_with_genres.groupby([constants.COL_USER_ID, constants.COL_GENRE_ID]).size().unstack(fill_value=0)
+    user_genre_read_count = train_with_genres[train_with_genres[constants.COL_HAS_READ] == 1] \
+        .groupby([constants.COL_USER_ID, constants.COL_GENRE_ID]).size().unstack()
+    user_genre_conversion = (user_genre_read_count / (user_genre_total.stack() + 1e-10)).unstack(fill_value=0)
+
+    # mapping book_id → список жанров
+    book_to_genres = book_genres_df.groupby(constants.COL_BOOK_ID)[constants.COL_GENRE_ID].apply(list)
+
+    def calculate_genre_match(row):
+        user_id = row[constants.COL_USER_ID]
+        book_id = row[constants.COL_BOOK_ID]
+
+        # Если книги нет в маппинге или у пользователя нет истории — возвращаем нули
+        if book_id not in book_to_genres:
+            return {'genre_read_match': 0.0, 'genre_planned_match': 0.0,
+                    'genre_conversion_match': 0.0, 'genre_count': 0}
+
+        genres = book_to_genres[book_id]
+
+        # Если у пользователя нет истории — возвращаем нули
+        if user_id not in user_genre_read_norm.index:
+            return {'genre_read_match': 0.0, 'genre_planned_match': 0.0,
+                    'genre_conversion_match': 0.0, 'genre_count': len(genres)}
+
+        read_scores = []
+        planned_scores = []
+        conv_scores = []
+
+        for genre in genres:
+            # безопасное получение значения (0.0 если столбца/строки нет)
+            read_scores.append(user_genre_read_norm.get((user_id, genre), 0.0))
+            planned_scores.append(user_genre_planned_norm.get((user_id, genre), 0.0))
+            conv_scores.append(user_genre_conversion.get((user_id, genre), 0.0))
+
+        return {
+            'genre_read_match': np.mean(read_scores) if read_scores else 0.0,
+            'genre_planned_match': np.mean(planned_scores) if planned_scores else 0.0,
+            'genre_conversion_match': np.mean(conv_scores) if conv_scores else 0.0,
+            'genre_count': len(genres)
+        }
+
+    print("  Calculating genre matches...")
+    genre_matches = df.apply(calculate_genre_match, axis=1, result_type='expand')
+
+    df[['genre_read_match',
+        'genre_planned_match',
+        'genre_conversion_match',
+        'book_genre_count']] = genre_matches
+
+    print(f"  → Genre preference features added: 4 new features")
+    return df
+
+
+def add_sequence_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет фичи на основе последовательностей взаимодействий.
+    """
+    print("Adding sequence features...")
+
+    train_df = train_df.sort_values([constants.COL_USER_ID, constants.COL_TIMESTAMP])
+
+    # 1. Паттерны чередования read/plan
+    def get_sequence_pattern(user_data):
+        if len(user_data) < 2:
+            return {'read_after_plan_ratio': 0, 'plan_after_read_ratio': 0}
+
+        transitions = []
+        for i in range(1, len(user_data)):
+            prev = user_data.iloc[i - 1][constants.COL_HAS_READ]
+            curr = user_data.iloc[i][constants.COL_HAS_READ]
+            transitions.append(f"{prev}->{curr}")
+
+        read_after_plan = transitions.count("0->1")
+        plan_after_read = transitions.count("1->0")
+        total_transitions = len(transitions)
+
+        return {
+            'read_after_plan_ratio': read_after_plan / total_transitions if total_transitions > 0 else 0,
+            'plan_after_read_ratio': plan_after_read / total_transitions if total_transitions > 0 else 0
+        }
+
+    user_sequence_patterns = train_df.groupby(constants.COL_USER_ID).apply(get_sequence_pattern).reset_index()
+    user_sequence_patterns = pd.DataFrame(
+        user_sequence_patterns[0].tolist(),
+        index=user_sequence_patterns[constants.COL_USER_ID]
+    ).reset_index()
+
+    user_sequence_patterns.columns = [constants.COL_USER_ID, 'read_after_plan_ratio', 'plan_after_read_ratio']
+
+    # 2. Длина текущей серии (сколько книг подряд в планах/прочитано)
+    def get_current_streak(user_data):
+        if len(user_data) == 0:
+            return {'current_streak_type': 0, 'current_streak_length': 0}
+
+        last_action = user_data.iloc[-1][constants.COL_HAS_READ]
+        streak_length = 1
+
+        for i in range(len(user_data) - 2, -1, -1):
+            if user_data.iloc[i][constants.COL_HAS_READ] == last_action:
+                streak_length += 1
+            else:
+                break
+
+        return {
+            'current_streak_type': last_action,
+            'current_streak_length': streak_length
+        }
+
+    user_streaks = train_df.groupby(constants.COL_USER_ID).apply(get_current_streak).reset_index()
+    user_streaks = pd.DataFrame(
+        user_streaks[0].tolist(),
+        index=user_streaks[constants.COL_USER_ID]
+    ).reset_index()
+
+    user_streaks.columns = [constants.COL_USER_ID, 'current_streak_type', 'current_streak_length']
+
+    # 3. Средняя длина серий
+    def get_avg_streak_length(user_data):
+        if len(user_data) == 0:
+            return {'avg_read_streak': 0, 'avg_plan_streak': 0}
+
+        streaks = []
+        current_type = user_data.iloc[0][constants.COL_HAS_READ]
+        current_length = 1
+
+        for i in range(1, len(user_data)):
+            if user_data.iloc[i][constants.COL_HAS_READ] == current_type:
+                current_length += 1
+            else:
+                streaks.append((current_type, current_length))
+                current_type = user_data.iloc[i][constants.COL_HAS_READ]
+                current_length = 1
+
+        streaks.append((current_type, current_length))
+
+        read_streaks = [length for type_, length in streaks if type_ == 1]
+        plan_streaks = [length for type_, length in streaks if type_ == 0]
+
+        return {
+            'avg_read_streak': np.mean(read_streaks) if read_streaks else 0,
+            'avg_plan_streak': np.mean(plan_streaks) if plan_streaks else 0
+        }
+
+    user_avg_streaks = train_df.groupby(constants.COL_USER_ID).apply(get_avg_streak_length).reset_index()
+    user_avg_streaks = pd.DataFrame(
+        user_avg_streaks[0].tolist(),
+        index=user_avg_streaks[constants.COL_USER_ID]
+    ).reset_index()
+
+    user_avg_streaks.columns = [constants.COL_USER_ID, 'avg_read_streak', 'avg_plan_streak']
+
+    # Объединяем все sequence фичи
+    sequence_features = user_sequence_patterns.merge(
+        user_streaks, on=constants.COL_USER_ID, how='left'
+    ).merge(
+        user_avg_streaks, on=constants.COL_USER_ID, how='left'
+    )
+
+    # Присоединяем к основному df
+    df = df.merge(sequence_features, on=constants.COL_USER_ID, how='left')
+
+    print(f"  → Sequence features added: {len(sequence_features.columns) - 1} new features")
+    return df
+
+
+def add_author_affinity_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет фичи аффинити к авторам.
+    """
+    print("Adding author affinity features...")
+
+    # 1. Статистика по авторам в истории пользователя
+    author_stats = train_df.groupby([constants.COL_USER_ID, constants.COL_AUTHOR_ID]).agg({
+        constants.COL_HAS_READ: ['count', 'mean', 'sum']
+    }).reset_index()
+
+    author_stats.columns = [
+        constants.COL_USER_ID, constants.COL_AUTHOR_ID,
+        'author_interaction_count', 'author_read_ratio', 'author_read_count'
+    ]
+
+    # 2. Для каждого пользователя: топ авторы
+    user_author_stats = author_stats.groupby(constants.COL_USER_ID).agg({
+        'author_interaction_count': ['max', 'mean', 'sum'],
+        'author_read_ratio': ['max', 'mean']
+    }).reset_index()
+
+    user_author_stats.columns = [
+        constants.COL_USER_ID,
+        'top_author_interactions', 'avg_author_interactions', 'total_author_interactions',
+        'top_author_read_ratio', 'avg_author_read_ratio'
+    ]
+
+    # 3. Для каждой пары (user, book) определяем, знаком ли автор
+    df = df.merge(user_author_stats, on=constants.COL_USER_ID, how='left')
+
+    # 4. Аффинити к автору текущей книги
+    author_affinity = author_stats.set_index([constants.COL_USER_ID, constants.COL_AUTHOR_ID])
+
+    def get_author_affinity(row):
+        user_id = row[constants.COL_USER_ID]
+        author_id = row[constants.COL_AUTHOR_ID]
+
+        if (user_id, author_id) in author_affinity.index:
+            stats = author_affinity.loc[(user_id, author_id)]
+            return {
+                'author_familiarity': stats['author_interaction_count'],
+                'author_read_ratio': stats['author_read_ratio'],
+                'author_read_count': stats['author_read_count']
+            }
+        else:
+            return {
+                'author_familiarity': 0,
+                'author_read_ratio': 0,
+                'author_read_count': 0
+            }
+
+    print("  Calculating author affinities...")
+    affinities = df.apply(get_author_affinity, axis=1)
+
+    df['author_familiarity'] = [x['author_familiarity'] for x in affinities]
+    df['author_read_ratio'] = [x['author_read_ratio'] for x in affinities]
+    df['author_read_count'] = [x['author_read_count'] for x in affinities]
+
+    # 5. Отношение к среднему по пользователю
+    df['author_familiarity_ratio'] = df['author_familiarity'] / (df['avg_author_interactions'] + 1e-10)
+    df['author_read_ratio_diff'] = df['author_read_ratio'] - df['avg_author_read_ratio']
+
+    print(f"  → Author affinity features added: {len(user_author_stats.columns) - 1 + 5} new features")
+    return df
+
+
+def add_cold_start_enhancements(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Улучшенные фичи для холодных кандидатов.
+    """
+    print("Adding cold start enhancements...")
+
+    # 1. Популярность книги среди похожих пользователей
+    # Группируем пользователей по демографии
+    train_df['age_group'] = pd.cut(train_df[constants.COL_AGE],
+                                   bins=[0, 18, 25, 35, 50, 100],
+                                   labels=['teen', 'young', 'adult', 'middle', 'senior'])
+
+    # Популярность книги в разных группах
+    for age_group in ['teen', 'young', 'adult', 'middle', 'senior']:
+        group_df = train_df[train_df['age_group'] == age_group]
+        if len(group_df) > 0:
+            book_popularity = group_df.groupby(constants.COL_BOOK_ID)[constants.COL_HAS_READ].agg(['count', 'mean'])
+            book_popularity.columns = [f'book_{age_group}_interactions', f'book_{age_group}_read_ratio']
+            df = df.merge(book_popularity, on=constants.COL_BOOK_ID, how='left')
+
+    # 2. Популярность книги среди пользователей того же пола
+    for gender in [1, 2]:
+        gender_df = train_df[train_df[constants.COL_GENDER] == gender]
+        if len(gender_df) > 0:
+            book_gender_popularity = gender_df.groupby(constants.COL_BOOK_ID)[constants.COL_HAS_READ].agg(
+                ['count', 'mean'])
+            book_gender_popularity.columns = [f'book_gender_{gender}_interactions', f'book_gender_{gender}_read_ratio']
+            df = df.merge(book_gender_popularity, on=constants.COL_BOOK_ID, how='left')
+
+    # 3. Новизна книги (год публикации)
+    current_year = train_df[constants.COL_PUBLICATION_YEAR].max()
+    df['book_age'] = current_year - df[constants.COL_PUBLICATION_YEAR]
+    df['book_is_recent'] = (df['book_age'] <= 5).astype(int)
+    df['book_is_old'] = (df['book_age'] > 20).astype(int)
+
+    # 4. Универсальность книги (сколько разных демографических групп ее читают)
+    demographic_columns = [col for col in df.columns if 'read_ratio' in col]
+    if demographic_columns:
+        df['book_demographic_variance'] = df[demographic_columns].std(axis=1)
+        df['book_demographic_coverage'] = (df[demographic_columns] > 0).sum(axis=1)
+
+    # 5. Признаки для абсолютно холодных кандидатов (нет в train)
+    train_books = set(train_df[constants.COL_BOOK_ID].unique())
+    df['is_completely_cold_book'] = (~df[constants.COL_BOOK_ID].isin(train_books)).astype(int)
+
+    train_users = set(train_df[constants.COL_USER_ID].unique())
+    df['is_completely_cold_user'] = (~df[constants.COL_USER_ID].isin(train_users)).astype(int)
+
+    print(f"  → Cold start enhancements added")
+    return df
+
+
+def add_interaction_dynamics(book_genres_df:  pd.DataFrame, df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет фичи динамики взаимодействий пользователя с книгами.
+    """
+    print("Adding interaction dynamics features...")
+
+    train_df_sorted = train_df.sort_values([constants.COL_USER_ID, constants.COL_TIMESTAMP])
+
+    # 1. Тенденция активности пользователя (увеличивается/уменьшается)
+    def get_activity_trend(user_data):
+        if len(user_data) < 3:
+            return {'activity_trend': 0, 'recent_activity_level': 0}
+
+        # Разделяем на раннюю и позднюю активность
+        split_point = len(user_data) // 2
+        early = user_data.iloc[:split_point]
+        late = user_data.iloc[split_point:]
+
+        early_rate = len(early) / max(
+            (early[constants.COL_TIMESTAMP].max() - early[constants.COL_TIMESTAMP].min()).days, 1)
+        late_rate = len(late) / max((late[constants.COL_TIMESTAMP].max() - late[constants.COL_TIMESTAMP].min()).days, 1)
+
+        recent_activity = len(user_data.iloc[-30:]) if len(user_data) >= 30 else len(user_data)
+
+        return {
+            'activity_trend': (late_rate - early_rate) / (early_rate + 1e-10),
+            'recent_activity_level': recent_activity
+        }
+
+    activity_trends = train_df_sorted.groupby(constants.COL_USER_ID).apply(get_activity_trend).reset_index()
+    activity_trends = pd.DataFrame(
+        activity_trends[0].tolist(),
+        index=activity_trends[constants.COL_USER_ID]
+    ).reset_index()
+
+    activity_trends.columns = [constants.COL_USER_ID, 'activity_trend', 'recent_activity_level']
+
+    # 2. Изменение конверсии со временем
+    def get_conversion_trend(user_data):
+        if len(user_data) < 3:
+            return {'conversion_trend': 0}
+
+        split_point = len(user_data) // 2
+        early = user_data.iloc[:split_point]
+        late = user_data.iloc[split_point:]
+
+        early_conversion = early[constants.COL_HAS_READ].mean()
+        late_conversion = late[constants.COL_HAS_READ].mean()
+
+        return {
+            'conversion_trend': late_conversion - early_conversion
+        }
+
+    conversion_trends = train_df_sorted.groupby(constants.COL_USER_ID).apply(get_conversion_trend).reset_index()
+    conversion_trends = pd.DataFrame(
+        conversion_trends[0].tolist(),
+        index=conversion_trends[constants.COL_USER_ID]
+    ).reset_index()
+
+    conversion_trends.columns = [constants.COL_USER_ID, 'conversion_trend']
+
+    # 3. Стабильность жанровых предпочтений
+    train_with_genres = train_df_sorted.merge(
+        book_genres_df[[constants.COL_BOOK_ID, constants.COL_GENRE_ID]].drop_duplicates(),
+        on=constants.COL_BOOK_ID,
+        how='left'
+    )
+
+    def get_genre_stability(user_data):
+        if len(user_data) < 2:
+            return {'genre_stability': 0}
+
+        genres = user_data[constants.COL_GENRE_ID].dropna().unique()
+        if len(genres) < 2:
+            return {'genre_stability': 1}
+
+        # Jaccard similarity между ранней и поздней половиной
+        split_point = len(user_data) // 2
+        early_genres = set(user_data.iloc[:split_point][constants.COL_GENRE_ID].dropna().unique())
+        late_genres = set(user_data.iloc[split_point:][constants.COL_GENRE_ID].dropna().unique())
+
+        if not early_genres or not late_genres:
+            return {'genre_stability': 0}
+
+        jaccard = len(early_genres & late_genres) / len(early_genres | late_genres)
+        return {'genre_stability': jaccard}
+
+    genre_stabilities = train_with_genres.groupby(constants.COL_USER_ID).apply(get_genre_stability).reset_index()
+    genre_stabilities = pd.DataFrame(
+        genre_stabilities[0].tolist(),
+        index=genre_stabilities[constants.COL_USER_ID]
+    ).reset_index()
+
+    genre_stabilities.columns = [constants.COL_USER_ID, 'genre_stability']
+
+    # Объединяем все dynamic фичи
+    dynamics_features = activity_trends.merge(
+        conversion_trends, on=constants.COL_USER_ID, how='left'
+    ).merge(
+        genre_stabilities, on=constants.COL_USER_ID, how='left'
+    )
+
+    # Присоединяем к основному df
+    df = df.merge(dynamics_features, on=constants.COL_USER_ID, how='left')
+
+    print(f"  → Interaction dynamics features added: {len(dynamics_features.columns) - 1} new features")
+    return df
+
+
+def create_enhanced_features(
+    df: pd.DataFrame,
+    book_genres_df: pd.DataFrame,
+    descriptions_df: pd.DataFrame,
+    include_aggregates: bool = True,
+    include_bert: bool = False,
+    include_nomic: bool = True,
+) -> pd.DataFrame:
+    """Улучшенный пайплайн создания фичей."""
+    print("Starting ENHANCED feature engineering pipeline...")
+
+    train_df = df[df[constants.COL_SOURCE] == constants.VAL_SOURCE_TRAIN].copy()
+
+    # 1. Базовые фичи
+    df = add_temporal_features(df, train_df)
+    df = add_interaction_feature(df, train_df)
+
+    # 2. Агрегатные фичи
+    if include_aggregates:
+        df = add_aggregate_features(df, train_df)
+
+    # 3. Улучшенные временные фичи
+    df = add_enhanced_temporal_features(df, train_df)
+
+    # 4. Жанровые предпочтения
+    df = add_genre_features(df, book_genres_df)
+    df = add_genre_preference_features(df, train_df, book_genres_df)
+
+    # 5. Фичи последовательностей
+    df = add_sequence_features(df, train_df)
+
+    # 6. Аффинити к авторам
+    df = add_author_affinity_features(df, train_df)
+
+    # 7. Улучшения для холодных кандидатов
+    df = add_cold_start_enhancements(df, train_df)
+
+    # 8. Динамика взаимодействий
+    df = add_interaction_dynamics(book_genres_df, df, train_df)
+
+    # 9. Текстовые фичи (опционально)
+    df = add_text_features(df, train_df, descriptions_df)
+
+    if include_bert:
+        print("USING BERT FEATURES")
+        df = add_bert_features(df, train_df, descriptions_df)
+    elif include_nomic:
+        print("USING NOMIC FEATURES")
+        df = add_nomic_features(df, train_df, descriptions_df)
+
+    # 10. Nomic профильные фичи
+    nomic_cols = [col for col in df.columns if col.startswith("nomic_pca_")]
+    if len(nomic_cols) > 0:
+        df = add_nomic_profile_features(df, train_df)
+    else:
+        print("Skipping Nomic profile features - no Nomic columns found")
+        # Создаем пустые столбцы
+        nomic_profile_cols = [
+            "user_book_nomic_cos_sim_read", "user_book_nomic_cos_sim_plan",
+            "user_book_nomic_cos_sim_all", "user_nomic_profile_strength",
+            "user_nomic_diversity", "nomic_distance_to_centroid"
+        ]
+        for col in nomic_profile_cols:
+            df[col] = 0.0
+
+    # 11. Фичи конверсии
+    df = add_conversion_features(df, train_df)
+
+    # 12. Обработка пропусков
+    df = handle_missing_values(df, train_df)
+
+    # 13. Создаем комбинированные фичи
+    print("Creating combined features...")
+
+    # Взаимодействие временных и жанровых фич
+    if 'user_activity_frequency' in df.columns and 'genre_read_match' in df.columns:
+        df['activity_genre_interaction'] = df['user_activity_frequency'] * df['genre_read_match']
+
+    # Комбинация конверсии и давности
+    if 'user_conversion_rate' in df.columns and 'days_since_last_activity' in df.columns:
+        df['conversion_recency_interaction'] = df['user_conversion_rate'] / (df['days_since_last_activity'] + 1)
+
+    # Сигнал "настроения" пользователя
+    if 'activity_trend' in df.columns and 'conversion_trend' in df.columns:
+        df['user_momentum'] = df['activity_trend'] * df['conversion_trend']
+
+    # Конвертируем категориальные колонки
+    for col in config.CAT_FEATURES:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+
+    print("ENHANCED feature engineering complete.")
+    print(f"Total features: {len(df.columns)}")
+
+    # Выводим информацию о новых фичах
+    new_feature_categories = {
+        'temporal': ['user_preferred_weekday', 'user_activity_frequency', 'days_since_last_activity'],
+        'genre': ['genre_read_match', 'genre_planned_match', 'genre_conversion_match'],
+        'sequence': ['read_after_plan_ratio', 'current_streak_length', 'avg_read_streak'],
+        'author': ['author_familiarity', 'author_read_ratio', 'author_familiarity_ratio'],
+        'cold_start': ['book_demographic_variance', 'is_completely_cold_book'],
+        'dynamics': ['activity_trend', 'conversion_trend', 'genre_stability']
+    }
+
+    for category, features in new_feature_categories.items():
+        existing_features = [f for f in features if f in df.columns]
+        if existing_features:
+            print(f"  {category.upper()} features: {len(existing_features)}")
+
+    return df
 
 def create_features(
     df: pd.DataFrame,
@@ -827,47 +1467,14 @@ def create_features(
     print("Starting feature engineering pipeline...")
     train_df = df[df[constants.COL_SOURCE] == constants.VAL_SOURCE_TRAIN].copy()
 
-    # Add temporal features (new addition to create required columns)
-    df = add_temporal_features(df, train_df)
-
-    # Add interaction feature first (must be computed before temporal split)
-    # This feature helps distinguish cold candidates from interacted books
-    df = add_interaction_feature(df, train_df)
-
-    # Aggregate features are computed separately during training to ensure
-    # no data leakage from validation set timestamps
-    if include_aggregates:
-        df = add_aggregate_features(df, train_df)
-
-    df = add_genre_features(df, book_genres_df)
-    df = add_text_features(df, train_df, descriptions_df)
-    if include_bert:
-        print("USING BERT FEATURES")
-        df = add_bert_features(df, train_df, descriptions_df)
-    elif include_nomic:
-        print("USING NOMIC FEATURES")
-        df = add_nomic_features(df, train_df, descriptions_df)
-
-    # Добавляем Nomic профильные фичи ТОЛЬКО если есть Nomic столбцы
-    nomic_cols = [col for col in df.columns if col.startswith("nomic_pca_")]
-    if len(nomic_cols) > 0:
-        df = add_nomic_profile_features(df, train_df)
-    else:
-        print("Skipping Nomic profile features - no Nomic columns found")
-        # Создаем пустые столбцы для избежания ошибки в handle_missing_values
-        df["user_book_nomic_cos_sim_read"] = 0.0
-        df["user_book_nomic_cos_sim_plan"] = 0.0
-        df["user_book_nomic_cos_sim_all"] = 0.0
-        df["user_nomic_profile_strength"] = 0.0
-        df["user_nomic_diversity"] = 0.5
-        df["nomic_distance_to_centroid"] = 0.0
-
-    df = handle_missing_values(df, train_df)
-
-    # Convert categorical columns to pandas 'category' dtype for LightGBM
-    for col in config.CAT_FEATURES:
-        if col in df.columns:
-            df[col] = df[col].astype("category")
+    featured_df = create_enhanced_features(
+        train_df,
+        book_genres_df,
+        descriptions_df,
+        include_aggregates=False,
+        include_bert=False,
+        include_nomic=True
+    )
 
     print("Feature engineering complete.")
     return df
