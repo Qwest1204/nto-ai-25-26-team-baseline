@@ -11,8 +11,107 @@ import torch
 from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 from . import config, constants
+
+
+def add_nomic_profile_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет мощные персональные фичи на основе Nomic эмбеддингов.
+    Работает только с train_df → нет утечек!
+    """
+    print("Adding Nomic profile features (this is the big one)...")
+
+    # Определяем колонки эмбеддингов (должны быть в processed_features.parquet)
+    nomic_cols = [col for col in df.columns if col.startswith("nomic_pca_")]
+    if len(nomic_cols) == 0:
+        print("  Warning: No Nomic columns found! Skipping profile features.")
+        return df
+    if len(nomic_cols) != 100:
+        print(f"  Warning: Expected 100 Nomic dims, got {len(nomic_cols)}")
+
+    embed_dim = len(nomic_cols)
+    embed_array = df[nomic_cols].values  # (N, 100)
+
+    # --- 1. Создаём профили пользователей из train_df ---
+    train_df = train_df.copy()
+
+    # Разделяем на прочитанные и запланированные
+    read_df = train_df[train_df[constants.COL_HAS_READ] == 1]
+    plan_df = train_df[train_df[constants.COL_HAS_READ] == 0]
+
+    # Профиль прочитанных (вес 2.0)
+    user_read_profile = read_df.groupby(constants.COL_USER_ID)[nomic_cols].mean()
+    user_read_profile = user_read_profile * 2.0  # усиливаем прочитанные
+
+    # Профиль запланированных (вес 1.0)
+    user_plan_profile = plan_df.groupby(constants.COL_USER_ID)[nomic_cols].mean()
+
+    # Общий профиль: взвешенная сумма
+    user_all_profile = pd.concat([user_read_profile, user_plan_profile]).groupby(level=0).sum()
+
+    # Нормализация профиля (чтобы косинус был в [-1,1])
+    user_all_profile_norm = np.linalg.norm(user_all_profile.values, axis=1, keepdims=True)
+    user_all_profile_norm[user_all_profile_norm == 0] = 1.0
+    user_all_profile_normalized = user_all_profile.values / user_all_profile_norm
+
+    # --- 2. Глобальный центр (для фичи популярности) ---
+    global_centroid = embed_array.mean(axis=0, keepdims=True)  # (1, 100)
+
+    # --- 3. Присоединяем профили к df ---
+    df = df.merge(user_read_profile.add_prefix("profile_read_"),
+                  left_on=constants.COL_USER_ID, right_index=True, how="left")
+    df = df.merge(user_plan_profile.add_prefix("profile_plan_"),
+                  left_on=constants.COL_USER_ID, right_index=True, how="left")
+    df = df.merge(user_all_profile,
+                  left_on=constants.COL_USER_ID, right_index=True, how="left", suffixes=("", "_all"))
+
+    # --- 4. Вычисляем косинусные сходства ---
+    book_embeddings = df[nomic_cols].values.astype(np.float32)
+
+    # Косинус с прочитанными
+    read_profiles = df[[f"profile_read_nomic_{i}" for i in range(embed_dim)]].fillna(0).values
+    read_norms = np.linalg.norm(read_profiles, axis=1, keepdims=True)
+    read_norms[read_norms == 0] = 1.0
+    cos_read = (book_embeddings * read_profiles).sum(axis=1) / (read_norms.squeeze() * np.linalg.norm(book_embeddings, axis=1))
+
+    # Косинус с запланированными
+    plan_profiles = df[[f"profile_plan_nomic_{i}" for i in range(embed_dim)]].fillna(0).values
+    plan_norms = np.linalg.norm(plan_profiles, axis=1, keepdims=True)
+    plan_norms[plan_norms == 0] = 1.0
+    cos_plan = (book_embeddings * plan_profiles).sum(axis=1) / (plan_norms.squeeze() * np.linalg.norm(book_embeddings, axis=1))
+
+    # Косинус с общим профилем
+    cos_all = cosine_similarity(book_embeddings, user_all_profile_normalized[
+        df[constants.COL_USER_ID].map({uid: idx for idx, uid in enumerate(user_all_profile.index)})
+    ]).diagonal()
+
+    df["user_book_nomic_cos_sim_read"] = np.nan_to_num(cos_read, nan=0.0)
+    df["user_book_nomic_cos_sim_plan"] = np.nan_to_num(cos_plan, nan=0.0)
+    df["user_book_nomic_cos_sim_all"]  = np.nan_to_num(cos_all,  nan=0.0)
+
+    # --- 5. Сила профиля (норма вектора) ---
+    profile_strength = np.linalg.norm(user_all_profile.values, axis=1)
+    df["user_nomic_profile_strength"] = df[constants.COL_USER_ID].map(
+        dict(zip(user_all_profile.index, profile_strength))
+    ).fillna(0.0)
+
+    # --- 6. Разнообразие вкусов (среднее расстояние между прочитанными) ---
+    diversity = read_df.groupby(constants.COL_USER_ID).apply(
+        lambda g: np.mean(cosine_similarity(g[nomic_cols])) if len(g) > 1 else 0.0
+    )
+    df["user_nomic_diversity"] = df[constants.COL_USER_ID].map(diversity).fillna(0.0)
+
+    # --- 7. Расстояние до глобального центра ---
+    df["nomic_distance_to_centroid"] = np.linalg.norm(book_embeddings - global_centroid, axis=1)
+
+    # Очистка временных колонок
+    df = df.drop(columns=[col for col in df.columns if col.startswith("profile_")], errors="ignore")
+
+    print(f"  → Nomic profile features added: 6 new powerful features")
+    return df
+
 
 def add_temporal_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -499,7 +598,7 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
     embeddings_array = np.array(embeddings_list)
 
     # Create DataFrame with NOMIC features
-    nomic_feature_names = [f"nomic_pca_{i}" for i in range(n_components)]
+    nomic_feature_names = [f"nomic_{i}" for i in range(n_components)]
     nomic_df = pd.DataFrame(embeddings_array, columns=nomic_feature_names, index=df.index)
 
     # Concatenate NOMIC features with main DataFrame
@@ -507,8 +606,81 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
     print(f"Added {len(nomic_feature_names)} compressed NOMIC features.")
     return df_with_nomic
 
+def add_conversion_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет 4 мощные фичи конверсии и поведения пользователя.
+    Всё строго на train_df → нет утечек.
+    """
+    print("Adding conversion & behavior features...")
 
-def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:  # noqa: C901
+    train_df = train_df.copy()
+
+    # --- 1. Глобальная конверсия пользователя ---
+    user_stats = train_df.groupby(constants.COL_USER_ID).agg(
+        total_interactions=('has_read', 'count'),
+        read_count=('has_read', 'sum'),
+        planned_count=('has_read', lambda x: (x == 0).sum())
+    ).reset_index()
+
+    # Сглаженная конверсия (Bayesian smoothing, чтобы не было 1.0 у новичков)
+    global_conversion = train_df[constants.COL_HAS_READ].mean()  # ~0.15–0.25
+    user_stats['user_conversion_rate'] = (
+        (user_stats['read_count'] + 5 * global_conversion) /
+        (user_stats['total_interactions'] + 5)
+    )
+
+    # Сколько читает в день (активность)
+    user_dates = train_df.groupby(constants.COL_USER_ID)[constants.COL_TIMESTAMP].agg(['min', 'max'])
+    user_dates['active_days'] = (user_dates['max'] - user_dates['min']).dt.days + 1
+    user_dates['active_days'] = user_dates['active_days'].clip(lower=1)
+    user_stats = user_stats.merge(user_dates[['active_days']], left_on='user_id', right_index=True, how='left')
+    user_stats['user_read_per_day'] = user_stats['read_count'] / user_stats['active_days']
+
+    # --- 2. Конверсия по жанрам (самое мощное!) ---
+    # Сначала соединяем train_df с жанрами (нужны book_genres_df, но у нас есть book_id → genre через merge)
+    # Если в train_df уже есть genre_id — отлично, иначе делаем merge
+    if constants.COL_GENRE_ID not in train_df.columns:
+        # Предполагаем, что в processed данных уже есть genre_id, иначе — подтянем
+        pass  # у вас уже должен быть genre_id в processed_features.parquet
+    else:
+        genre_conv = train_df.groupby([constants.COL_USER_ID, constants.COL_GENRE_ID])['has_read'].mean().reset_index()
+        genre_conv = genre_conv.rename(columns={'has_read': 'genre_conversion'})
+        # Присоединяем к каждой строке по user + genre книги
+        if constants.COL_GENRE_ID in df.columns:
+            df = df.merge(
+                genre_conv,
+                on=[constants.COL_USER_ID, constants.COL_GENRE_ID],
+                how='left'
+            )
+            df['user_genre_conversion_rate'] = df['genre_conversion'].fillna(global_conversion)
+
+    # --- 3. Конверсия по авторам ---
+    if constants.COL_AUTHOR_ID in train_df.columns:
+        author_conv = train_df.groupby([constants.COL_USER_ID, constants.COL_AUTHOR_ID])['has_read'].mean().reset_index()
+        author_conv = author_conv.rename(columns={'has_read': 'author_conversion'})
+        df = df.merge(
+            author_conv,
+            on=[constants.COL_USER_ID, constants.COL_AUTHOR_ID],
+            how='left'
+        )
+        df['user_author_conversion_rate'] = df['author_conversion'].fillna(global_conversion)
+
+    # --- 4. Присоединяем user-level фичи ---
+    user_features = user_stats[[
+        constants.COL_USER_ID,
+        'user_conversion_rate',
+        'user_read_per_day'
+    ]]
+    df = df.merge(user_features, on=constants.COL_USER_ID, how='left')
+
+    # Заполняем холодных пользователей глобальными значениями
+    df['user_conversion_rate'] = df['user_conversion_rate'].fillna(global_conversion)
+    df['user_read_per_day'] = df['user_read_per_day'].fillna(0.0)
+
+    print(f"  → Conversion features added: user_conversion_rate, user_read_per_day, genre/author conversion")
+    return df
+
+def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
     """Fills missing values using a defined strategy.
 
     Fills missing values for age, aggregated features, and categorical features
@@ -531,8 +703,10 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
         lambda x: (train_df[constants.COL_TIMESTAMP].max() - x).days).median()
     df['user_last_interaction_delta'] = df['user_last_interaction_delta'].fillna(np.log1p(global_delta_median))
 
-    global_freq_mean = (train_df.groupby(constants.COL_USER_ID).size() / (train_df.groupby(constants.COL_USER_ID)[constants.COL_TIMESTAMP].apply(lambda x: (x.max() - x.min()).days + 1).clip(lower=1))
-                         ).mean()
+    global_freq_mean = (train_df.groupby(constants.COL_USER_ID).size() / (
+        train_df.groupby(constants.COL_USER_ID)[constants.COL_TIMESTAMP].apply(
+            lambda x: (x.max() - x.min()).days + 1).clip(lower=1))
+                        ).mean()
 
     df['user_interaction_frequency'] = df['user_interaction_frequency'].fillna(global_freq_mean)
 
@@ -572,18 +746,30 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
     for col in bert_cols:
         df[col] = df[col].fillna(0.0)
 
-    #Fill Nomic skips
+    # Fill Nomic skips
     nomic_cols = [col for col in df.columns if col.startswith("nomic_")]
     for col in nomic_cols:
         df[col] = df[col].fillna(0.0)
 
-    # Fill remaining categorical features with a special value
-    for col in config.CAT_FEATURES:
+    # Fill Nomic profile features only if they exist
+    nomic_profile_cols = [
+        "user_book_nomic_cos_sim_read",
+        "user_book_nomic_cos_sim_plan",
+        "user_book_nomic_cos_sim_all",
+        "user_nomic_profile_strength",
+        "user_nomic_diversity",
+        "nomic_distance_to_centroid"
+    ]
+
+    for col in nomic_profile_cols:
         if col in df.columns:
-            if df[col].dtype.name in ("category", "object") and df[col].isna().any():
-                df[col] = df[col].astype(str).fillna(constants.MISSING_CAT_VALUE).astype("category")
-            elif pd.api.types.is_numeric_dtype(df[col].dtype) and df[col].isna().any():
-                df[col] = df[col].fillna(constants.MISSING_NUM_VALUE)
+            if col == "user_nomic_diversity":
+                df[col] = df[col].fillna(0.5)  # среднее разнообразие
+            elif col == "nomic_distance_to_centroid":
+                df[col] = df[col].fillna(
+                    df["nomic_distance_to_centroid"].median() if "nomic_distance_to_centroid" in df.columns else 0.0)
+            else:
+                df[col] = df[col].fillna(0.0)
 
     temporal_stats = df.attrs.get('temporal_global_stats', {})
 
@@ -601,6 +787,14 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
     for col in ['interaction_month_sin', 'interaction_month_cos']:
         if col in df.columns:
             df[col] = df[col].fillna(0.0)
+
+    # Fill remaining categorical features with a special value
+    for col in config.CAT_FEATURES:
+        if col in df.columns:
+            if df[col].dtype.name in ("category", "object") and df[col].isna().any():
+                df[col] = df[col].astype(str).fillna(constants.MISSING_CAT_VALUE).astype("category")
+            elif pd.api.types.is_numeric_dtype(df[col].dtype) and df[col].isna().any():
+                df[col] = df[col].fillna(constants.MISSING_NUM_VALUE)
 
     return df
 
@@ -653,6 +847,21 @@ def create_features(
     elif include_nomic:
         print("USING NOMIC FEATURES")
         df = add_nomic_features(df, train_df, descriptions_df)
+
+    # Добавляем Nomic профильные фичи ТОЛЬКО если есть Nomic столбцы
+    nomic_cols = [col for col in df.columns if col.startswith("nomic_pca_")]
+    if len(nomic_cols) > 0:
+        df = add_nomic_profile_features(df, train_df)
+    else:
+        print("Skipping Nomic profile features - no Nomic columns found")
+        # Создаем пустые столбцы для избежания ошибки в handle_missing_values
+        df["user_book_nomic_cos_sim_read"] = 0.0
+        df["user_book_nomic_cos_sim_plan"] = 0.0
+        df["user_book_nomic_cos_sim_all"] = 0.0
+        df["user_nomic_profile_strength"] = 0.0
+        df["user_nomic_diversity"] = 0.5
+        df["nomic_distance_to_centroid"] = 0.0
+
     df = handle_missing_values(df, train_df)
 
     # Convert categorical columns to pandas 'category' dtype for LightGBM

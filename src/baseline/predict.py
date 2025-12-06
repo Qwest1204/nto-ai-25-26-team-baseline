@@ -77,8 +77,21 @@ def predict() -> None:
     book_data_df = book_data_df.drop_duplicates(subset=[constants.COL_BOOK_ID])
     candidates_with_meta = candidates_with_meta.merge(book_data_df, on=constants.COL_BOOK_ID, how="left")
 
+    # Сначала добавим жанровые фичи
+    print("Adding genre features...")
+    genre_counts = book_genres_df.groupby(constants.COL_BOOK_ID)[constants.COL_GENRE_ID].count().reset_index()
+    genre_counts.columns = [
+        constants.COL_BOOK_ID,
+        constants.F_BOOK_GENRES_COUNT,
+    ]
+    candidates_with_meta = candidates_with_meta.merge(genre_counts, on=constants.COL_BOOK_ID, how="left")
+
+    # Добавим базовые временные фичи
     candidates_with_meta = add_temporal_features(candidates_with_meta, train_df)
-    candidates_with_meta = handle_missing_values(candidates_with_meta, train_df)
+
+    # Заполним отсутствующие значения в жанрах
+    candidates_with_meta[constants.F_BOOK_GENRES_COUNT] = candidates_with_meta[constants.F_BOOK_GENRES_COUNT].fillna(0)
+
     # Add base features from prepared data (genres, text features)
     # We'll match by book_id to get TF-IDF and BERT features
     book_features = featured_df[[constants.COL_BOOK_ID]].drop_duplicates()
@@ -87,24 +100,24 @@ def predict() -> None:
         col
         for col in featured_df.columns
         if col
-        not in [
-            constants.COL_USER_ID,
-            constants.COL_BOOK_ID,
-            constants.COL_SOURCE,
-            constants.COL_TIMESTAMP,
-            constants.COL_HAS_READ,
-            constants.COL_TARGET,
-            constants.COL_PREDICTION,
-            constants.COL_GENDER,
-            constants.COL_AGE,
-            constants.COL_AUTHOR_ID,
-            constants.COL_PUBLICATION_YEAR,
-            constants.COL_LANGUAGE,
-            constants.COL_PUBLISHER,
-            constants.COL_AVG_RATING,
-        ]
-        and not col.startswith("tfidf_")
-        and not col.startswith("bert_")
+           not in [
+               constants.COL_USER_ID,
+               constants.COL_BOOK_ID,
+               constants.COL_SOURCE,
+               constants.COL_TIMESTAMP,
+               constants.COL_HAS_READ,
+               constants.COL_TARGET,
+               constants.COL_PREDICTION,
+               constants.COL_GENDER,
+               constants.COL_AGE,
+               constants.COL_AUTHOR_ID,
+               constants.COL_PUBLICATION_YEAR,
+               constants.COL_LANGUAGE,
+               constants.COL_PUBLISHER,
+               constants.COL_AVG_RATING,
+           ]
+           and not col.startswith("tfidf_")
+           and not col.startswith("bert_")
     ]
 
     # Add genre count and text features
@@ -140,10 +153,7 @@ def predict() -> None:
     print("\nComputing aggregate features on all train data...")
     candidates_with_agg = add_aggregate_features(candidates_with_meta.copy(), train_df)
 
-    print("\nComputing temporal features on all train data...")
-    candidates_with_agg = add_temporal_features(candidates_with_agg, train_df)
-
-    # Handle missing values
+    # Обрабатываем отсутствующие значения - только один раз после всех добавлений
     print("Handling missing values...")
     candidates_final = handle_missing_values(candidates_with_agg, train_df)
 
@@ -177,10 +187,10 @@ def predict() -> None:
         constants.COL_BOOK_ID,
     ]
     candidates_final = candidates_final.drop(
-        columns=[col for col in candidates_final.columns if col not in features and col not in exclude_cols + [constants.COL_USER_ID, constants.COL_BOOK_ID]],
+        columns=[col for col in candidates_final.columns if
+                 col not in features and col not in exclude_cols + [constants.COL_USER_ID, constants.COL_BOOK_ID]],
         errors="ignore"
     )
-
 
     # Add missing features with default values
     missing_features = [f for f in features if f not in candidates_final.columns]
@@ -190,7 +200,8 @@ def predict() -> None:
             if feat in train_df.columns:
                 if train_df[feat].dtype.name == "category":
                     default_val = train_df[feat].cat.categories[0] if len(train_df[feat].cat.categories) > 0 else 0
-                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final), categories=train_df[feat].cat.categories, ordered=False)
+                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final),
+                                                            categories=train_df[feat].cat.categories, ordered=False)
                 else:
                     candidates_final[feat] = train_df[feat].iloc[0] if len(train_df) > 0 else 0
             else:
@@ -204,7 +215,8 @@ def predict() -> None:
             if feat in train_df.columns:
                 if train_df[feat].dtype.name == "category":
                     default_val = train_df[feat].cat.categories[0] if len(train_df[feat].cat.categories) > 0 else 0
-                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final), categories=train_df[feat].cat.categories, ordered=False)
+                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final),
+                                                            categories=train_df[feat].cat.categories, ordered=False)
                 else:
                     candidates_final[feat] = train_df[feat].iloc[0] if len(train_df) > 0 else 0
             else:
@@ -229,7 +241,8 @@ def predict() -> None:
             valid_mask = candidates_final[col].isin([str(cat) for cat in train_categories])
             if not valid_mask.all():
                 invalid_count = (~valid_mask).sum()
-                print(f"Warning: {invalid_count} values in {col} not in training categories, replacing with first category")
+                print(
+                    f"Warning: {invalid_count} values in {col} not in training categories, replacing with first category")
                 candidates_final.loc[~valid_mask, col] = str(train_categories[0]) if len(train_categories) > 0 else "0"
 
             # Convert categories back to original type and create categorical
@@ -244,7 +257,8 @@ def predict() -> None:
                 candidates_final[col] = candidates_final[col].astype(str).map(
                     {str(cat): cat for cat in train_categories}
                 ).fillna(train_categories[0])
-                candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_categories, ordered=False)
+                candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_categories,
+                                                       ordered=False)
 
     X_test = candidates_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1, errors="ignore")
     print(f"Prediction features: {len(X_test.columns)}")  # Updated to use X_test.columns
@@ -330,5 +344,7 @@ def predict() -> None:
     print(f"Users with recommendations: {non_empty}/{len(submission_df)}")
 
 
+if __name__ == "__main__":
+    predict()
 if __name__ == "__main__":
     predict()
