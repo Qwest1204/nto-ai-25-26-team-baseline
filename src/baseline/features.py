@@ -388,7 +388,7 @@ def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df
     return df_with_bert
 
 
-def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame, n_components: int = 64) -> pd.DataFrame:
+def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame, n_components: int = 768) -> pd.DataFrame:
     """
     Adds NOMIC embeddings from book descriptions, with PCA compression fitted on training data.
 
