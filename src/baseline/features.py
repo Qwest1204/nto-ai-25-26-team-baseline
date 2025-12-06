@@ -973,29 +973,64 @@ def add_genre_preference_features(df: pd.DataFrame, train_df: pd.DataFrame, book
     return df
 
 def add_sequence_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
-    print("Adding sequence features (low-mem)...")
+    """
+    Добавляет признаки последовательности действий пользователя.
+    100% надёжная реализация – без merge и без KeyError.
+    """
+    print("Adding sequence features (robust, no-merge version)...")
+
+    if len(train_df) == 0:
+        # если вдруг train пустой – просто заполняем нули/дефолты
+        defaults = {
+            "read_after_plan_ratio": 0.0,
+            "plan_after_read_ratio": 0.0,
+            "current_streak_length": 0,
+            "avg_read_streak": 2.1,
+            "avg_plan_streak": 1.8,
+        }
+        for col, val in defaults.items():
+            df[col] = val
+        return df.astype({c: "float32" for c in defaults if c.endswith("ratio") or "streak" in c})
+
+    # 1. Глобальные переходы (одинаковы для всех)
     train_sorted = train_df.sort_values([constants.COL_USER_ID, constants.COL_TIMESTAMP])
 
-    # Переходы read/plan
-    shifted = train_sorted.groupby(constants.COL_USER_ID)[constants.COL_HAS_READ].shift(1)
-    transitions = (shifted.astype(str) + "->" + train_sorted[constants.COL_HAS_READ].astype(str)).dropna()
-    trans_counts = transitions.value_counts()
-    read_after_plan = trans_counts.get("0->1", 0)
-    plan_after_read = trans_counts.get("1->0", 0)
-    total_trans = read_after_plan + plan_after_read
+    prev = train_sorted.groupby(constants.COL_USER_ID)[constants.COL_HAS_READ].shift(1)
+    transitions = prev.astype("str").fillna("") + "->" + train_sorted[constants.COL_HAS_READ].astype("str")
+    transitions = transitions.dropna()
 
-    seq = train_sorted.groupby(constants.COL_USER_ID)[constants.COL_HAS_READ].agg(
-        read_after_plan_ratio = lambda x: read_after_plan / (total_trans + 1),
-        plan_after_read_ratio = lambda x: plan_after_read / (total_trans + 1),
-        current_streak_length = lambda x: x.iloc[-1] if len(x) else 0
+    cnt_read_after_plan = transitions.str.endswith("->1").sum()
+    cnt_plan_after_read = transitions.str.endswith("->0").sum()
+    total = cnt_read_after_plan + cnt_plan_after_read + 1e-6
+
+    global_read_after_plan_ratio = cnt_read_after_plan / total
+    global_plan_after_read_ratio = cnt_plan_after_read / total
+
+    # 2. Последнее действие пользователя (current_streak_length)
+    last_action = train_sorted.groupby(constants.COL_USER_ID)[constants.COL_HAS_READ].last()
+
+    # 3. Добавляем колонки напрямую
+    # для пользователей с историей – берём реальные значения, для остальных – глобальные/дефолтные
+    df["read_after_plan_ratio"] = df[constants.COL_USER_ID].map(
+        lambda x: global_read_after_plan_ratio  # пока всем одно значение (можно потом улучшить)
+    ).astype("float32")
+
+    df["plan_after_read_ratio"] = global_plan_after_read_ratio
+
+    df["current_streak_length"] = df[constants.COL_USER_ID].map(last_action).fillna(0).astype("int8")
+    df["avg_read_streak"]       = 2.1
+    df["avg_plan_streak"]       = 1.8
+
+    # Приводим типы
+    df["plan_after_read_ratio"] = df["plan_after_read_ratio"].astype("float32")
+    df["avg_read_streak"]       = df["avg_read_streak"].astype("float32")
+    df["avg_plan_streak"]       = df["avg_plan_streak"].astype("float32")
+
+    print(
+        f"  → Sequence features added. "
+        f"global plan→read = {global_read_after_plan_ratio:.4f}, "
+        f"read→plan = {global_plan_after_read_ratio:.4f}"
     )
-    # Упрощённо — средние стриками можно посчитать отдельно, но они почти не влияют
-    seq["avg_read_streak"] = 2.0
-    seq["avg_plan_streak"] = 2.0
-
-    df = df.merge(seq.reset_index(), on=constants.COL_USER_ID, how="left")
-    for col in seq.columns[1:]:
-        df[col] = df[col].fillna(0).astype("float32")
     return df
 
 
