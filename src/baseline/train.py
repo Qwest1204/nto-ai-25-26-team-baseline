@@ -1,254 +1,224 @@
-"""
-Main training script for the LightGBM model.
-
-Uses temporal split with absolute date threshold to ensure methodologically
-correct validation without data leakage from future timestamps.
-"""
-
 import json
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from catboost import CatBoostClassifier, Pool
-import optuna
-import torch
+from catboost import CatBoostRanker, Pool
+import lightgbm as lgb
+from sklearn.model_selection import GroupKFold
 
 from . import config, constants
-from .evaluate import dcg_at_k, ndcg_at_k
-from .features import add_aggregate_features, handle_missing_values, add_temporal_features
+from .features import (
+    add_aggregate_features, add_temporal_features,
+    add_nomic_profile_features, add_conversion_features, handle_missing_values
+)
 from .temporal_split import get_split_date_from_ratio, temporal_split_by_date
 
 
-
-def train() -> None:
-    """Runs the model training pipeline with temporal split.
-
-    Loads prepared data from data/processed/, performs temporal split based on
-    absolute date threshold, computes aggregate features on train split only,
-    and trains a single LightGBM model for multiclass classification (relevance).
-    Relevance classes: 0=cold candidates, 1=planned books, 2=read books.
-    This ensures methodologically correct validation without data leakage from
-    future timestamps.
-
-    Note: Data must be prepared first using prepare_data.py
-    """
-    # Load prepared data
+def train_2stage():
+    # === 1. Загрузка данных (как раньше) ===
     processed_path = config.PROCESSED_DATA_DIR / constants.PROCESSED_DATA_FILENAME
+    df = pd.read_parquet(processed_path, engine="pyarrow")
+    train_set = df[df[constants.COL_SOURCE] == constants.VAL_SOURCE_TRAIN].copy()
 
-    if not processed_path.exists():
-        raise FileNotFoundError(
-            f"Processed data not found at {processed_path}. "
-            "Please run 'poetry run python -m src.baseline.prepare_data' first."
-        )
+    # Temporal split
+    split_date = get_split_date_from_ratio(train_set, config.TEMPORAL_SPLIT_RATIO)
+    train_mask, val_mask = temporal_split_by_date(train_set, split_date)
 
-    print(f"Loading prepared data from {processed_path}...")
-    featured_df = pd.read_parquet(processed_path, engine="pyarrow")
-    print(f"Loaded {len(featured_df):,} rows with {len(featured_df.columns)} features")
-
-    # Separate train set
-    train_set = featured_df[featured_df[constants.COL_SOURCE] == constants.VAL_SOURCE_TRAIN].copy()
-
-    # Check for timestamp column
-    if constants.COL_TIMESTAMP not in train_set.columns:
-        raise ValueError(
-            f"Timestamp column '{constants.COL_TIMESTAMP}' not found in train set. "
-            "Make sure data was prepared with timestamp preserved."
-        )
-
-    # Ensure timestamp is datetime
-    if not pd.api.types.is_datetime64_any_dtype(train_set[constants.COL_TIMESTAMP]):
-        train_set[constants.COL_TIMESTAMP] = pd.to_datetime(train_set[constants.COL_TIMESTAMP])
-
-    # Perform temporal split
-    print(f"\nPerforming temporal split with ratio {config.TEMPORAL_SPLIT_RATIO}...")
-    split_date = get_split_date_from_ratio(train_set, config.TEMPORAL_SPLIT_RATIO, constants.COL_TIMESTAMP)
-    print(f"Split date: {split_date}")
-
-    train_mask, val_mask = temporal_split_by_date(train_set, split_date, constants.COL_TIMESTAMP)
-
-    # Split data
     train_split = train_set[train_mask].copy()
     val_split = train_set[val_mask].copy()
 
-    print(f"Train split: {len(train_split):,} rows")
-    print(f"Validation split: {len(val_split):,} rows")
+    # === 2. Полный feature engineering ===
+    for split, base in [(train_split, train_split), (val_split, train_split)]:
+        split = add_aggregate_features(split, base)
+        split = add_temporal_features(split, base)
+        split = add_nomic_profile_features(split, base)
+        split = add_conversion_features(split, base)
+        split = handle_missing_values(split, base)
 
-    # Verify temporal correctness
-    max_train_timestamp = train_split[constants.COL_TIMESTAMP].max()
-    min_val_timestamp = val_split[constants.COL_TIMESTAMP].min()
-    print(f"Max train timestamp: {max_train_timestamp}")
-    print(f"Min validation timestamp: {min_val_timestamp}")
+    # Финальные сеты
+    train_df = train_split
+    val_df = val_split
 
-    if min_val_timestamp <= max_train_timestamp:
-        raise ValueError(
-            f"Temporal split validation failed: min validation timestamp ({min_val_timestamp}) "
-            f"is not greater than max train timestamp ({max_train_timestamp})."
-        )
-    print("✅ Temporal split validation passed: all validation timestamps are after train timestamps")
+    # === 3. Подготовка фич ===
+    exclude_cols = [constants.COL_USER_ID, constants.COL_BOOK_ID, constants.COL_SOURCE,
+                    constants.COL_TIMESTAMP, constants.COL_HAS_READ, constants.COL_RELEVANCE,
+                    'prediction', 'group_id']
 
-    # Compute aggregate features on train split only (to prevent data leakage)
-    print("\nComputing aggregate features on train split only...")
-    train_split_with_agg = add_aggregate_features(train_split.copy(), train_split)
-    val_split_with_agg = add_aggregate_features(val_split.copy(), train_split)  # Use train_split for aggregates!
+    # Сначала получим все колонки, кроме исключенных
+    all_features = [c for c in train_df.columns if c not in exclude_cols]
 
-    print("\nComputing temporal features on train split only...")
-    train_split_with_agg = add_temporal_features(train_split_with_agg, train_split)
-    val_split_with_agg = add_temporal_features(val_split_with_agg, train_split)  # важно: только train_split!
+    # Отфильтруем только числовые и категориальные колонки
+    features = []
+    for c in all_features:
+        dtype = train_df[c].dtype.name
+        # Включаем числовые типы и категории
+        if dtype in ['int8', 'int16', 'int32', 'int64',
+                     'float16', 'float32', 'float64', 'bool',
+                     'category']:
+            features.append(c)
+        else:
+            print(f"Warning: Excluding column {c} with dtype {dtype} from features")
 
-    # Handle missing values
-    print("Handling missing values...")
-    train_split_final = handle_missing_values(train_split_with_agg, train_split)
-    val_split_final = handle_missing_values(val_split_with_agg, train_split)
+    print(f"Selected {len(features)} features")
 
-    # Define features (X) and target (y)
-    # Exclude timestamp, source, target, prediction columns
-    exclude_cols = [
-        constants.COL_SOURCE,
-        config.TARGET,
-        constants.COL_PREDICTION,
-        constants.COL_TIMESTAMP,
-    ]
-    features = [col for col in train_split_final.columns if col not in exclude_cols]
+    # Убедимся, что все категориальные колонки имеют тип 'category'
+    for col in features:
+        if train_df[col].dtype.name == 'object':
+            print(f"Converting {col} from object to category")
+            # Преобразуем object в category
+            train_df[col] = train_df[col].astype('category')
+            val_df[col] = val_df[col].astype('category')
 
-    # Exclude any remaining object columns that are not model features
-    non_feature_object_cols = train_split_final[features].select_dtypes(include=["object"]).columns.tolist()
-    features = [f for f in features if f not in non_feature_object_cols]
+    X_train = train_df[features]
+    X_val = val_df[features]
+    y_train = train_df[constants.COL_RELEVANCE]
+    y_val = val_df[constants.COL_RELEVANCE]
 
-    X_train = train_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
-    y_train = train_split_final[config.TARGET].replace({1:0, 2:1})
-    X_val = val_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
-    y_val = val_split_final[config.TARGET].replace({1:0, 2:1})
-    # Optimize memory usage: convert float64 to float32 (reduces memory by ~50%)
-    print("Optimizing data types for memory efficiency...")
-    float64_cols = X_train.select_dtypes(include=["float64"]).columns
-    if len(float64_cols) > 0:
-        print(f"  Converting {len(float64_cols)} float64 columns to float32...")
-        X_train[float64_cols] = X_train[float64_cols].astype("float32")
-        X_val[float64_cols] = X_val[float64_cols].astype("float32")
-        print(f"  Memory saved: ~{X_train[float64_cols].memory_usage(deep=True).sum() / 1024**2 / 2:.1f} MB")
+    # Проверим, что нет строковых значений в данных
+    print("Checking for non-numeric values in features...")
+    for col in features:
+        if train_df[col].dtype.name not in ['category', 'bool']:
+            # Проверим на наличие нечисловых значений
+            try:
+                # Пробуем преобразовать в float
+                _ = train_df[col].astype(float)
+            except Exception as e:
+                print(f"Error in column {col}: {e}")
+                print(f"Unique values in {col}: {train_df[col].unique()[:10]}")
 
-    # Identify categorical features for LightGBM
-    categorical_features = [
-        f for f in features if train_split_final[f].dtype.name == "category"
-    ]
-    if categorical_features:
-        print(f"  Categorical features: {len(categorical_features)} ({categorical_features[:5]}...)")
+    # Преобразуем bool в int для CatBoost
+    for col in features:
+        if train_df[col].dtype.name == 'bool':
+            train_df[col] = train_df[col].astype(int)
+            val_df[col] = val_df[col].astype(int)
 
-    print(f"Training features: {len(features)}")
-    print(f"  Training data shape: {X_train.shape}, Memory: {X_train.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
+    # Обновляем X_train и X_val после преобразований
+    X_train = train_df[features]
+    X_val = val_df[features]
 
-    # Ensure model directory exists
-    config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    groups_train = train_df.groupby(constants.COL_USER_ID).size().values
+    groups_val = val_df.groupby(constants.COL_USER_ID).size().values
 
-    # Prepare pools for CatBoost
-    train_pool = Pool(X_train, y_train, cat_features=categorical_features)
-    val_pool = Pool(X_val, y_val, cat_features=categorical_features)
+    cat_features = [i for i, c in enumerate(features) if X_train[c].dtype.name == 'category']
 
-    best_params = config.CATBOOST_PARAMS.copy()
+    print(f"Number of categorical features: {len(cat_features)}")
+    print(f"Categorical feature indices: {cat_features}")
 
-    # Define Optuna objective
-    def objective(trial):
-        params = {
-            "loss_function": "MultiClass",
-            "eval_metric": "TotalF1",
-            "iterations": trial.suggest_int("iterations", 1000, 3000, step=100),  # Around default 2000
-            "learning_rate": trial.suggest_float("learning_rate", 0.001, 0.1, log=True),  # Around default 0.01
-            "depth": trial.suggest_int("depth", 4, 10),  # Around default 6
-            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True),  # Around default 10.0
-            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.5, 1.5),  # Around default 1.0
-            "random_strength": trial.suggest_float("random_strength", 0.5, 2.0, log=True),  # Around default 1.0
-            "max_bin": trial.suggest_int("max_bin", 100, 300, step=50),  # Around default 254
-            #"rsm": trial.suggest_float("rsm", 0.5, 1.0),  # Around default 0.7 - not for GPU!!!
-            "random_seed": config.RANDOM_STATE,
-            "thread_count": -1,
-            "auto_class_weights": "Balanced",
-            "task_type": "GPU" if torch and torch.cuda.is_available() else "CPU",
-            "devices": "0" if torch and torch.cuda.is_available() else None,
-        }
+    # === 4. Stage 1: CatBoostRanker ===
+    print("Training Stage 1: CatBoostRanker...")
 
-        model = CatBoostClassifier(**params)
-        model.fit(
-            train_pool,
-            eval_set=val_pool,
-            early_stopping_rounds=config.EARLY_STOPPING_ROUNDS,
-            verbose=False,
-        )
+    # Создадим копии данных для CatBoost
+    X_train_cb = X_train.copy()
+    X_val_cb = X_val.copy()
 
-        val_preds = model.predict(val_pool)
-        return f1_score(y_val, val_preds, average="weighted")
+    # Преобразуем категориальные колонки в строки для CatBoost
+    for idx in cat_features:
+        col = features[idx]
+        X_train_cb[col] = X_train_cb[col].astype(str).fillna('nan')
+        X_val_cb[col] = X_val_cb[col].astype(str).fillna('nan')
 
-    if config.OPTIM_WITH_OPTUNA:
-        # Run Optuna optimization
-        print("\nStarting Optuna hyperparameter optimization...")
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=50)  # Adjust n_trials as needed
+    cb_pool_train = Pool(X_train_cb, y_train, group_id=train_df[constants.COL_USER_ID], cat_features=cat_features)
+    cb_pool_val = Pool(X_val_cb, y_val, group_id=val_df[constants.COL_USER_ID], cat_features=cat_features)
 
-        print("\nBest hyperparameters found:")
-        print(study.best_params)
-        print(f"Best F1 score: {study.best_value:.4f}")
-
-        # Update parameters with best found
-        best_params = config.CATBOOST_PARAMS.copy()
-        best_params.update(study.best_params)
-
-
-    # Train final model with best parameters
-    print("\nTraining final CatBoost model with final hyperparameters...")
-    print("  Classes: 0=cold candidates, 1=planned books, 2=read books")
-    if 'num_class' in best_params:
-        del best_params['num_class']
-    if 'objective' in best_params:
-        best_params['loss_function'] = 'MultiClass'
-    model = CatBoostClassifier(**best_params)
-
-    model.fit(
-        train_pool,
-        eval_set=val_pool,
-        early_stopping_rounds=config.EARLY_STOPPING_ROUNDS,
-        verbose=True,
+    cb_model = CatBoostRanker(
+        iterations=2500,
+        learning_rate=0.03,
+        depth=8,
+        l2_leaf_reg=10,
+        loss_function='YetiRank',
+        eval_metric='NDCG:top=20',
+        random_seed=42,
+        verbose=200,
     )
 
-    # Evaluate the model
-    val_preds = model.predict(X_val).ravel()
-    val_proba = model.predict_proba(X_val)  # Shape: (n_samples, 3) for 3 classes
+    try:
+        cb_model.fit(cb_pool_train, eval_set=cb_pool_val, early_stopping_rounds=100)
+    except Exception as e:
+        print(f"Error fitting CatBoost: {e}")
+        # Выведем больше информации о данных
+        print("Data types in X_train_cb:")
+        print(X_train_cb.dtypes.value_counts())
+        print("\nSample of X_train_cb:")
+        print(X_train_cb.head())
+        raise
 
-    accuracy = accuracy_score(y_val, val_preds)
-    # For multiclass, use average='weighted' or 'macro'
-    precision = precision_score(y_val, val_preds, average="weighted", zero_division=0)
-    recall = recall_score(y_val, val_preds, average="weighted", zero_division=0)
+    score1_train = cb_model.predict(cb_pool_train)
+    score1_val = cb_model.predict(cb_pool_val)
 
-    # Class distribution
-    class_dist = pd.Series(val_preds).value_counts().sort_index()
-    class_proba_mean = val_proba.mean(axis=0)
+    # Сохраняем Stage 1
+    cb_model.save_model(str(config.MODEL_DIR / "stage1_catboost.cbm"))
 
-    print(f"\nValidation metrics:")
-    print(f"  Accuracy: {accuracy:.4f}")
-    print(f"  Precision (weighted): {precision:.4f}")
-    print(f"  Recall (weighted): {recall:.4f}")
-    print(f"  Predicted class distribution:")
-    for class_idx in range(val_proba.shape[1]):
-        count = class_dist.get(class_idx, 0)
-        proba_mean = class_proba_mean[class_idx]
-        print(f"    Class {class_idx}: {count} samples ({100*count/len(val_preds):.1f}%), mean proba: {proba_mean:.4f}")
+    # === 5. Stage 2: LightGBM на остатках ===
+    print("Training Stage 2: LightGBM on residuals...")
 
-    # Save the trained model
-    model_path = config.MODEL_DIR / config.MODEL_FILENAME
-    model.save_model(str(model_path))
-    print(f"Model saved → {model_path}")
+    # Остатки: relevance - λ × score1
+    lambda_residual = 0.8
+    residual_train = y_train.values - lambda_residual * score1_train
+    residual_val = y_val.values - lambda_residual * score1_val
 
-    with open(config.MODEL_DIR / "features_list.json", "w") as f:
-        json.dump(features, f)
-    print(f"Feature list saved → {config.MODEL_DIR / 'features_list.json'}")
+    # Добавляем score1 как главную фичу
+    X_train2 = X_train.copy()
+    X_val2 = X_val.copy()
+    X_train2['score_stage1'] = score1_train
+    X_val2['score_stage1'] = score1_val
+    features2 = features + ['score_stage1']
 
-    # Save best parameters
-    with open(config.MODEL_DIR / "best_params.json", "w") as f:
-        json.dump(best_params, f)
-    print(f"Best parameters saved → {config.MODEL_DIR / 'best_params.json'}")
+    # Для LightGBM преобразуем категории в целые числа
+    for col in features2:
+        if X_train2[col].dtype.name == 'category':
+            X_train2[col] = X_train2[col].cat.codes
+            X_val2[col] = X_val2[col].cat.codes
 
-    print("\nTraining completed successfully.")
+    lgb_train = lgb.Dataset(X_train2, label=residual_train, group=groups_train)
+    lgb_val = lgb.Dataset(X_val2, label=residual_val, group=groups_val, reference=lgb_train)
+
+    lgb_params = {
+        'objective': 'lambdarank',
+        'metric': 'ndcg',
+        'ndcg_at': [20],
+        'learning_rate': 0.02,
+        'num_leaves': 128,
+        'min_data_in_leaf': 50,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 5,
+        'verbose': -1,
+        'lambda_l2': 10,
+    }
+
+    lgb_model = lgb.train(
+        lgb_params,
+        lgb_train,
+        num_boost_round=3000,
+        valid_sets=[lgb_val],
+        callbacks=[lgb.early_stopping(150)],
+        verbose_eval=100,
+    )
+
+    lgb_model.save_model(str(config.MODEL_DIR / "stage2_lightgbm.txt"))
+
+    # === 6. Финальный скор ===
+    final_pred_val = score1_val + lgb_model.predict(X_val2)
+
+    # Оценка
+    from .evaluate import ndcg_at_k
+    ndcgs = []
+    for user_id, group in val_df.groupby(constants.COL_USER_ID):
+        idx = group.index
+        scores = final_pred_val[val_df.index.get_indexer(idx)]
+        relevance = group[constants.COL_RELEVANCE].values
+        # реальный ndcg
+        ranked_rel = [r for _, r in sorted(zip(scores, relevance), reverse=True)][:20]
+        ndcgs.append(ndcg_at_k(ranked_rel, k=20))
+    print(f"Final Validation NDCG@20: {np.mean(ndcgs):.6f}")
+
+    # Сохраняем список фич
+    features_path = config.MODEL_DIR / "features_list.json"
+    with open(features_path, "w") as f:
+        json.dump(features2, f)
+    print(f"Features list saved to {features_path}")
+
+    print("2-stage model trained and saved!")
 
 
-if __name__ == "__main__":
-    train()
+train_2stage()
