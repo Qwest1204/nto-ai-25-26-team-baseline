@@ -1,11 +1,3 @@
-import json
-from pathlib import Path
-import numpy as np
-import pandas as pd
-from catboost import CatBoostRanker, Pool
-import lightgbm as lgb
-from sklearn.model_selection import GroupKFold
-
 from . import config, constants
 from .features import (
     add_aggregate_features, add_temporal_features,
@@ -13,6 +5,14 @@ from .features import (
 )
 from .temporal_split import get_split_date_from_ratio, temporal_split_by_date
 
+
+import optuna
+import numpy as np
+import pandas as pd
+import json
+from catboost import CatBoostRanker, Pool
+import lightgbm as lgb
+from .evaluate import ndcg_at_k  # Assuming this is already defined in the module
 
 def train_2stage():
     # === 1. Загрузка данных (как раньше) ===
@@ -23,7 +23,6 @@ def train_2stage():
     # Temporal split
     split_date = get_split_date_from_ratio(train_set, config.TEMPORAL_SPLIT_RATIO)
     train_mask, val_mask = temporal_split_by_date(train_set, split_date)
-
     train_split = train_set[train_mask].copy()
     val_split = train_set[val_mask].copy()
 
@@ -40,25 +39,19 @@ def train_2stage():
     val_df = val_split
 
     # === 3. Подготовка фич ===
-    exclude_cols = [constants.COL_USER_ID, constants.COL_BOOK_ID, constants.COL_SOURCE,
-                    constants.COL_TIMESTAMP, constants.COL_HAS_READ, constants.COL_RELEVANCE,
-                    'prediction', 'group_id']
-
+    exclude_cols = [constants.COL_USER_ID, constants.COL_BOOK_ID, constants.COL_SOURCE, constants.COL_TIMESTAMP,
+                    constants.COL_HAS_READ, constants.COL_RELEVANCE, 'prediction', 'group_id']
     # Сначала получим все колонки, кроме исключенных
     all_features = [c for c in train_df.columns if c not in exclude_cols]
-
     # Отфильтруем только числовые и категориальные колонки
     features = []
     for c in all_features:
         dtype = train_df[c].dtype.name
         # Включаем числовые типы и категории
-        if dtype in ['int8', 'int16', 'int32', 'int64',
-                     'float16', 'float32', 'float64', 'bool',
-                     'category']:
+        if dtype in ['int8', 'int16', 'int32', 'int64', 'float16', 'float32', 'float64', 'bool', 'category']:
             features.append(c)
         else:
             print(f"Warning: Excluding column {c} with dtype {dtype} from features")
-
     print(f"Selected {len(features)} features")
 
     # Убедимся, что все категориальные колонки имеют тип 'category'
@@ -84,7 +77,6 @@ def train_2stage():
     val_group_ids = val_df[constants.COL_USER_ID].values
 
     cat_features = [i for i, c in enumerate(features) if X_train[c].dtype.name == 'category']
-
     print(f"Number of categorical features: {len(cat_features)}")
     print(f"Categorical feature indices: {cat_features}")
     print(f"Categorical feature names: {[features[i] for i in cat_features]}")
@@ -93,8 +85,8 @@ def train_2stage():
     print(f"Train groups: {len(np.unique(train_group_ids))} users, {len(train_df)} rows")
     print(f"Val groups: {len(np.unique(val_group_ids))} users, {len(val_df)} rows")
 
-    # === 4. Stage 1: CatBoostRanker ===
-    print("Training Stage 1: CatBoostRanker...")
+    # === 4. Stage 1: CatBoostRanker с Optuna ===
+    print("Tuning Stage 1: CatBoostRanker with Optuna...")
 
     # Создадим копии данных для CatBoost
     X_train_cb = X_train.copy()
@@ -108,7 +100,6 @@ def train_2stage():
 
     # Создаем Pool для CatBoost Ranker
     print("Creating CatBoost Pool...")
-
     try:
         cb_pool_train = Pool(
             data=X_train_cb,
@@ -116,7 +107,6 @@ def train_2stage():
             group_id=train_group_ids,
             cat_features=cat_features
         )
-
         cb_pool_val = Pool(
             data=X_val_cb,
             label=y_val,
@@ -127,20 +117,46 @@ def train_2stage():
         print(f"Error creating CatBoost Pool: {e}")
         raise
 
+    def objective_stage1(trial):
+        params = {
+            'iterations': trial.suggest_int('iterations', 500, 3000),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'depth': trial.suggest_int('depth', 4, 10),
+            'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 100, log=True),
+            'loss_function': 'YetiRank',
+            'eval_metric': 'NDCG:top=20',
+            'random_seed': 42,
+            'verbose': 200,
+        }
+        model = CatBoostRanker(**params)
+        model.fit(cb_pool_train, eval_set=cb_pool_val, early_stopping_rounds=100)
+        pred = model.predict(cb_pool_val)
+        ndcgs = []
+        for user_id, group in val_df.groupby(constants.COL_USER_ID):
+            idx = group.index
+            scores = pred[val_df.index.get_indexer(idx)]
+            relevance = group[constants.COL_RELEVANCE].values
+            ranked_rel = [r for _, r in sorted(zip(scores, relevance), reverse=True)][:20]
+            ndcgs.append(ndcg_at_k(ranked_rel, k=20))
+        return np.mean(ndcgs)
+
+    study1 = optuna.create_study(direction='maximize')
+    study1.optimize(objective_stage1, n_trials=20)
+    best_params1 = study1.best_params
+    print(f"Best params for Stage 1: {best_params1}")
+
+    # Train best model for Stage 1
     cb_model = CatBoostRanker(
-        iterations=2500,
-        learning_rate=0.03,
-        depth=8,
-        l2_leaf_reg=10,
+        iterations=best_params1['iterations'],
+        learning_rate=best_params1['learning_rate'],
+        depth=best_params1['depth'],
+        l2_leaf_reg=best_params1['l2_leaf_reg'],
         loss_function='YetiRank',
         eval_metric='NDCG:top=20',
         random_seed=42,
         verbose=200,
     )
-
-    print("Fitting CatBoost Ranker...")
     cb_model.fit(cb_pool_train, eval_set=cb_pool_val, early_stopping_rounds=100)
-
     score1_train = cb_model.predict(cb_pool_train)
     score1_val = cb_model.predict(cb_pool_val)
 
@@ -148,8 +164,8 @@ def train_2stage():
     cb_model.save_model(str(config.MODEL_DIR / "stage1_catboost.cbm"))
     print("Stage 1 model saved.")
 
-    # === 5. Stage 2: LightGBM с фичей из Stage 1 ===
-    print("Training Stage 2: LightGBM with Stage 1 predictions as feature...")
+    # === 5. Stage 2: LightGBM с фичей из Stage 1 и Optuna ===
+    print("Tuning Stage 2: LightGBM with Stage 1 predictions as feature and Optuna...")
 
     # Добавляем score1 как главную фичу
     X_train2 = X_train.copy()
@@ -185,49 +201,75 @@ def train_2stage():
     lgb_y_val = lgb_y_val.astype(int)
 
     lgb_train = lgb.Dataset(
-        X_train2,
-        label=lgb_y_train,
-        group=train_group_sizes
+        X_train2, label=lgb_y_train, group=train_group_sizes
     )
     lgb_val = lgb.Dataset(
-        X_val2,
-        label=lgb_y_val,
-        group=val_group_sizes,
-        reference=lgb_train
+        X_val2, label=lgb_y_val, group=val_group_sizes, reference=lgb_train
     )
 
+    def objective_stage2(trial):
+        params = {
+            'objective': 'lambdarank',
+            'metric': 'ndcg',
+            'ndcg_at': [20],
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 31, 256),
+            'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 20, 100),
+            'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 1.0),
+            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 1.0),
+            'bagging_freq': 5,
+            'verbose': -1,
+            'lambda_l2': trial.suggest_float('lambda_l2', 0.1, 10, log=True),
+        }
+        model = lgb.train(
+            params,
+            lgb_train,
+            num_boost_round=3000,
+            valid_sets=[lgb_val],
+            callbacks=[lgb.early_stopping(100)],
+        )
+        pred = model.predict(X_val2)
+        ndcgs = []
+        for user_id, group in val_df.groupby(constants.COL_USER_ID):
+            idx = group.index
+            scores = pred[val_df.index.get_indexer(idx)]
+            relevance = group[constants.COL_RELEVANCE].values
+            ranked_rel = [r for _, r in sorted(zip(scores, relevance), reverse=True)][:20]
+            ndcgs.append(ndcg_at_k(ranked_rel, k=20))
+        return np.mean(ndcgs)
+
+    study2 = optuna.create_study(direction='maximize')
+    study2.optimize(objective_stage2, n_trials=20)
+    best_params2 = study2.best_params
+    print(f"Best params for Stage 2: {best_params2}")
+
+    # Train best model for Stage 2
     lgb_params = {
         'objective': 'lambdarank',
         'metric': 'ndcg',
         'ndcg_at': [20],
-        'learning_rate': 0.02,
-        'num_leaves': 128,
-        'min_data_in_leaf': 50,
-        'feature_fraction': 0.8,
-        'bagging_fraction': 0.8,
+        'learning_rate': best_params2['learning_rate'],
+        'num_leaves': best_params2['num_leaves'],
+        'min_data_in_leaf': best_params2['min_data_in_leaf'],
+        'feature_fraction': best_params2['feature_fraction'],
+        'bagging_fraction': best_params2['bagging_fraction'],
         'bagging_freq': 5,
         'verbose': -1,
-        'lambda_l2': 10,
+        'lambda_l2': best_params2['lambda_l2'],
     }
-
-    print("Training LightGBM model...")
     lgb_model = lgb.train(
         lgb_params,
         lgb_train,
         num_boost_round=3000,
         valid_sets=[lgb_val],
         callbacks=[lgb.early_stopping(150)],
-        #verbose_eval=100,
     )
-
     lgb_model.save_model(str(config.MODEL_DIR / "stage2_lightgbm.txt"))
     print("Stage 2 model saved.")
 
     # === 6. Финальный скор ===
     final_pred_val = lgb_model.predict(X_val2)
-
     # Оценка
-    from .evaluate import ndcg_at_k
     ndcgs = []
     for user_id, group in val_df.groupby(constants.COL_USER_ID):
         idx = group.index
@@ -243,8 +285,6 @@ def train_2stage():
     with open(features_path, "w") as f:
         json.dump(features2, f)
     print(f"Features list saved to {features_path}")
-
     print("2-stage model trained and saved!")
-
 
 train_2stage()
