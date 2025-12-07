@@ -8,6 +8,7 @@ and saves the processed data to data/processed/ for use in training and predicti
 from . import config, constants
 from .data_processing import load_and_merge_data
 from .features import create_features
+import pandas as pd
 
 
 def prepare_data() -> None:
@@ -35,6 +36,11 @@ def prepare_data() -> None:
 
     # Apply feature engineering WITHOUT aggregates
     # Aggregates will be computed during training on train split only
+    users_df = pd.read_csv(config.RAW_DATA_DIR / "users.csv")
+    books_df = pd.read_csv(config.RAW_DATA_DIR / "books.csv")
+    merged_df = merged_df.merge(users_df, on=constants.COL_USER_ID, how='left')
+    merged_df = merged_df.merge(books_df[['book_id', 'publication_year', 'language', 'publisher']],
+                                on=constants.COL_BOOK_ID, how='left')  # Добавьте другие колонки если нужно
     # BERT disabled for faster testing (can be enabled by setting include_bert=True)
     featured_df = create_features(merged_df, book_genres_df, descriptions_df, include_aggregates=False, include_bert=False, include_nomic=True)
 

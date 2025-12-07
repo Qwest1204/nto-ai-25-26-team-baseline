@@ -1,7 +1,3 @@
-"""
-Feature engineering script.
-"""
-
 import time
 import gc
 import joblib
@@ -15,16 +11,41 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from . import config, constants
 
-# Вспомогательная функция: безопасное удаление колонок + gc
 def downcast_ids(df: pd.DataFrame) -> pd.DataFrame:
     for col in [constants.COL_USER_ID, constants.COL_BOOK_ID, constants.COL_AUTHOR_ID, constants.COL_GENRE_ID]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], downcast='unsigned')
     return df
 
-# ===================================================================
-# 1. САМАЯ ТЯЖЁЛАЯ ФУНКЦИЯ — полностью переписана на NumPy
-# ===================================================================
+
+def add_rating_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    print("Adding rating features...")
+
+    # User-level: avg rating for read vs planned
+    read_ratings = train_df[train_df[constants.COL_HAS_READ] == 1].groupby(constants.COL_USER_ID)['rating'].agg(
+        ['mean', 'std', 'count']).reset_index()
+    read_ratings.columns = [constants.COL_USER_ID, 'user_read_avg_rating', 'user_read_rating_std',
+                            'user_read_rating_count']
+
+    plan_ratings = train_df[train_df[constants.COL_HAS_READ] == 0].groupby(constants.COL_USER_ID)['rating'].agg(
+        ['mean', 'std']).reset_index()
+    plan_ratings.columns = [constants.COL_USER_ID, 'user_plan_avg_rating', 'user_plan_rating_std']
+
+    df = df.merge(read_ratings, on=constants.COL_USER_ID, how='left')
+    df = df.merge(plan_ratings, on=constants.COL_USER_ID, how='left')
+
+    # Book-level: rating variance
+    book_rating_var = train_df.groupby(constants.COL_BOOK_ID)['rating'].std().reset_index(name='book_rating_variance')
+    df = df.merge(book_rating_var, on=constants.COL_BOOK_ID, how='left')
+
+    # Fill missing
+    for col in ['user_read_avg_rating', 'user_read_rating_std', 'user_plan_avg_rating', 'user_plan_rating_std',
+                'book_rating_variance']:
+        df[col] = df[col].fillna(0)
+
+    print("  → Rating features added")
+    return df
+
 def add_nomic_profile_features(df: pd.DataFrame, train_df: pd.DataFrame, chunk_size: int = 500_000) -> pd.DataFrame:
     print("Adding Nomic profile features (MEMORY-EFFICIENT chunked version)...")
 
@@ -610,80 +631,55 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
     print(f"Added {len(nomic_feature_names)} compressed NOMIC features.")
     return df_with_nomic
 
+
 def add_conversion_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Добавляет 4 мощные фичи конверсии и поведения пользователя.
-    Всё строго на train_df → нет утечек.
-    """
+    """Векторизованная версия для скорости"""
     print("Adding conversion & behavior features...")
 
-    train_df = train_df
-
-    # --- 1. Глобальная конверсия пользователя ---
+    # 1. User conversion (векторизованно)
     user_stats = train_df.groupby(constants.COL_USER_ID).agg(
-        total_interactions=('has_read', 'count'),
-        read_count=('has_read', 'sum'),
-        planned_count=('has_read', lambda x: (x == 0).sum())
+        total_interactions=(config.TARGET, 'count'),
+        read_count=(config.TARGET, 'sum'),
+        planned_count=(config.TARGET, lambda x: (x == 0).sum())
     ).reset_index()
 
-    # Сглаженная конверсия (Bayesian smoothing, чтобы не было 1.0 у новичков)
-    global_conversion = train_df[constants.COL_HAS_READ].mean()  # ~0.15–0.25
+    global_conversion = train_df[config.TARGET].mean()
     user_stats['user_conversion_rate'] = (
-        (user_stats['read_count'] + 5 * global_conversion) /
-        (user_stats['total_interactions'] + 5)
+        (user_stats['read_count'] + 10 * global_conversion) /
+        (user_stats['total_interactions'] + 10)
     )
 
-    # Сколько читает в день (активность)
-    user_dates = train_df.groupby(constants.COL_USER_ID)[constants.COL_TIMESTAMP].agg(['min', 'max'])
-    user_dates['active_days'] = (user_dates['max'] - user_dates['min']).dt.days + 1
-    user_dates['active_days'] = user_dates['active_days'].clip(lower=1)
-    user_stats = user_stats.merge(user_dates[['active_days']], left_on='user_id', right_index=True, how='left')
-    user_stats['user_read_per_day'] = user_stats['read_count'] / user_stats['active_days']
-
-    # --- 2. Конверсия по жанрам (самое мощное!) ---
-    # Сначала соединяем train_df с жанрами (нужны book_genres_df, но у нас есть book_id → genre через merge)
-    # Если в train_df уже есть genre_id — отлично, иначе делаем merge
-    if constants.COL_GENRE_ID not in train_df.columns:
-        # Предполагаем, что в processed данных уже есть genre_id, иначе — подтянем
-        pass  # у вас уже должен быть genre_id в processed_features.parquet
-    else:
-        genre_conv = train_df.groupby([constants.COL_USER_ID, constants.COL_GENRE_ID])['has_read'].mean().reset_index()
-        genre_conv = genre_conv.rename(columns={'has_read': 'genre_conversion'})
-        # Присоединяем к каждой строке по user + genre книги
-        if constants.COL_GENRE_ID in df.columns:
-            df = df.merge(
-                genre_conv,
-                on=[constants.COL_USER_ID, constants.COL_GENRE_ID],
-                how='left'
-            )
-            df['user_genre_conversion_rate'] = df['genre_conversion'].fillna(global_conversion)
-
-    # --- 3. Конверсия по авторам ---
+    # 2. Author conversion (если есть данные)
     if constants.COL_AUTHOR_ID in train_df.columns:
-        author_conv = train_df.groupby([constants.COL_USER_ID, constants.COL_AUTHOR_ID])['has_read'].mean().reset_index()
-        author_conv = author_conv.rename(columns={'has_read': 'author_conversion'})
+        author_conv = train_df.groupby(
+            [constants.COL_USER_ID, constants.COL_AUTHOR_ID]
+        )[config.TARGET].mean().reset_index()
+        author_conv.columns = [constants.COL_USER_ID, constants.COL_AUTHOR_ID, 'user_author_conversion']
+
         df = df.merge(
             author_conv,
             on=[constants.COL_USER_ID, constants.COL_AUTHOR_ID],
             how='left'
         )
-        df['user_author_conversion_rate'] = df['author_conversion'].fillna(global_conversion)
+        df['user_author_conversion'] = df['user_author_conversion'].fillna(global_conversion)
 
-    # --- 4. Присоединяем user-level фичи ---
-    user_features = user_stats[[
-        constants.COL_USER_ID,
-        'user_conversion_rate',
-        'user_read_per_day'
-    ]]
-    df = df.merge(user_features, on=constants.COL_USER_ID, how='left')
+    # 3. User activity
+    train_df[constants.COL_TIMESTAMP] = pd.to_datetime(train_df[constants.COL_TIMESTAMP])
+    user_activity = train_df.groupby(constants.COL_USER_ID)[constants.COL_TIMESTAMP].agg(['min', 'max', 'count'])
+    user_activity['active_days'] = (user_activity['max'] - user_activity['min']).dt.days + 1
+    user_activity['interactions_per_day'] = user_activity['count'] / user_activity['active_days'].clip(lower=1)
 
-    # Заполняем холодных пользователей глобальными значениями
+    df = df.merge(
+        user_activity[['interactions_per_day']].reset_index(),
+        on=constants.COL_USER_ID,
+        how='left'
+    )
+
+    # 4. Fill missing values
     df['user_conversion_rate'] = df['user_conversion_rate'].fillna(global_conversion)
-    df['user_read_per_day'] = df['user_read_per_day'].fillna(0.0)
+    df['interactions_per_day'] = df['interactions_per_day'].fillna(0)
 
-    print(f"  → Conversion features added: user_conversion_rate, user_read_per_day, genre/author conversion")
     return df
-
 def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
     """Fills missing values using a defined strategy.
 
@@ -972,67 +968,28 @@ def add_genre_preference_features(df: pd.DataFrame, train_df: pd.DataFrame, book
     gc.collect()
     return df
 
-def add_sequence_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Добавляет признаки последовательности действий пользователя.
-    100% надёжная реализация – без merge и без KeyError.
-    """
-    print("Adding sequence features (robust, no-merge version)...")
 
-    if len(train_df) == 0:
-        # если вдруг train пустой – просто заполняем нули/дефолты
-        defaults = {
-            "read_after_plan_ratio": 0.0,
-            "plan_after_read_ratio": 0.0,
-            "current_streak_length": 0,
-            "avg_read_streak": 2.1,
-            "avg_plan_streak": 1.8,
-        }
-        for col, val in defaults.items():
-            df[col] = val
-        return df.astype({c: "float32" for c in defaults if c.endswith("ratio") or "streak" in c})
+def add_simple_sequence_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """Упрощенная версия sequence features"""
+    print("Adding simple sequence features...")
 
-    # 1. Глобальные переходы (одинаковы для всех)
+    # Sort by timestamp
     train_sorted = train_df.sort_values([constants.COL_USER_ID, constants.COL_TIMESTAMP])
 
-    prev = train_sorted.groupby(constants.COL_USER_ID)[constants.COL_HAS_READ].shift(1)
-    transitions = prev.astype("str").fillna("") + "->" + train_sorted[constants.COL_HAS_READ].astype("str")
-    transitions = transitions.dropna()
+    # Last action type for each user
+    last_actions = train_sorted.groupby(constants.COL_USER_ID)[config.TARGET].last()
+    df['last_action_type'] = df[constants.COL_USER_ID].map(last_actions).fillna(-1)
 
-    cnt_read_after_plan = transitions.str.endswith("->1").sum()
-    cnt_plan_after_read = transitions.str.endswith("->0").sum()
-    total = cnt_read_after_plan + cnt_plan_after_read + 1e-6
+    # Action streaks (simplified)
+    train_sorted['action_change'] = train_sorted.groupby(constants.COL_USER_ID)[config.TARGET].diff().fillna(0)
+    streak_info = train_sorted.groupby(constants.COL_USER_ID).agg(
+        avg_streak_length=(config.TARGET, lambda x: x.groupby(x.ne(x.shift()).cumsum()).size().mean()),
+        streak_changes=('action_change', lambda x: (x != 0).sum())
+    ).fillna(0)
 
-    global_read_after_plan_ratio = cnt_read_after_plan / total
-    global_plan_after_read_ratio = cnt_plan_after_read / total
+    df = df.merge(streak_info, on=constants.COL_USER_ID, how='left')
 
-    # 2. Последнее действие пользователя (current_streak_length)
-    last_action = train_sorted.groupby(constants.COL_USER_ID)[constants.COL_HAS_READ].last()
-
-    # 3. Добавляем колонки напрямую
-    # для пользователей с историей – берём реальные значения, для остальных – глобальные/дефолтные
-    df["read_after_plan_ratio"] = df[constants.COL_USER_ID].map(
-        lambda x: global_read_after_plan_ratio  # пока всем одно значение (можно потом улучшить)
-    ).astype("float32")
-
-    df["plan_after_read_ratio"] = global_plan_after_read_ratio
-
-    df["current_streak_length"] = df[constants.COL_USER_ID].map(last_action).fillna(0).astype("int8")
-    df["avg_read_streak"]       = 2.1
-    df["avg_plan_streak"]       = 1.8
-
-    # Приводим типы
-    df["plan_after_read_ratio"] = df["plan_after_read_ratio"].astype("float32")
-    df["avg_read_streak"]       = df["avg_read_streak"].astype("float32")
-    df["avg_plan_streak"]       = df["avg_plan_streak"].astype("float32")
-
-    print(
-        f"  → Sequence features added. "
-        f"global plan→read = {global_read_after_plan_ratio:.4f}, "
-        f"read→plan = {global_plan_after_read_ratio:.4f}"
-    )
     return df
-
 
 def add_author_affinity_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
     print("Adding author affinity features (vectorized)...")
@@ -1062,25 +1019,25 @@ def add_author_affinity_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd
 
 def add_cold_start_enhancements(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Улучшенные фичи для холодных кандидатов.
+    Adds features for cold start scenarios based on demographics (age, gender) and book novelty.
     """
     print("Adding cold start enhancements...")
 
-    # 1. Популярность книги среди похожих пользователей
-    # Группируем пользователей по демографии
-    train_df['age_group'] = pd.cut(train_df[constants.COL_AGE],
-                                   bins=[0, 18, 25, 35, 50, 100],
-                                   labels=['teen', 'young', 'adult', 'middle', 'senior'])
+    # Create age_group bins for train_df and df
+    age_bins = [0, 18, 25, 35, 50, 120]
+    age_labels = ['teen', 'young', 'adult', 'middle', 'senior']
+    train_df['age_group'] = pd.cut(train_df[constants.COL_AGE], bins=age_bins, labels=age_labels)
+    df['age_group'] = pd.cut(df[constants.COL_AGE], bins=age_bins, labels=age_labels)
 
-    # Популярность книги в разных группах
-    for age_group in ['teen', 'young', 'adult', 'middle', 'senior']:
+    # 1. Book popularity in different age groups
+    for age_group in age_labels:
         group_df = train_df[train_df['age_group'] == age_group]
         if len(group_df) > 0:
             book_popularity = group_df.groupby(constants.COL_BOOK_ID)[constants.COL_HAS_READ].agg(['count', 'mean'])
             book_popularity.columns = [f'book_{age_group}_interactions', f'book_{age_group}_read_ratio']
             df = df.merge(book_popularity, on=constants.COL_BOOK_ID, how='left')
 
-    # 2. Популярность книги среди пользователей того же пола
+    # 2. Book popularity among users of the same gender
     for gender in [1, 2]:
         gender_df = train_df[train_df[constants.COL_GENDER] == gender]
         if len(gender_df) > 0:
@@ -1089,19 +1046,19 @@ def add_cold_start_enhancements(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.
             book_gender_popularity.columns = [f'book_gender_{gender}_interactions', f'book_gender_{gender}_read_ratio']
             df = df.merge(book_gender_popularity, on=constants.COL_BOOK_ID, how='left')
 
-    # 3. Новизна книги (год публикации)
+    # 3. Book novelty (publication year)
     current_year = train_df[constants.COL_PUBLICATION_YEAR].max()
     df['book_age'] = current_year - df[constants.COL_PUBLICATION_YEAR]
     df['book_is_recent'] = (df['book_age'] <= 5).astype(int)
     df['book_is_old'] = (df['book_age'] > 20).astype(int)
 
-    # 4. Универсальность книги (сколько разных демографических групп ее читают)
+    # 4. Book universality (how many different demographic groups read it)
     demographic_columns = [col for col in df.columns if 'read_ratio' in col]
     if demographic_columns:
         df['book_demographic_variance'] = df[demographic_columns].std(axis=1)
         df['book_demographic_coverage'] = (df[demographic_columns] > 0).sum(axis=1)
 
-    # 5. Признаки для абсолютно холодных кандидатов (нет в train)
+    # 5. Features for completely cold candidates (not in train)
     train_books = set(train_df[constants.COL_BOOK_ID].unique())
     df['is_completely_cold_book'] = (~df[constants.COL_BOOK_ID].isin(train_books)).astype(int)
 
@@ -1112,7 +1069,7 @@ def add_cold_start_enhancements(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.
     return df
 
 
-def add_interaction_dynamics(book_genres_df:  pd.DataFrame, df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+def add_interaction_dynamics(book_genres_df: pd.DataFrame, df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
     """
     Добавляет фичи динамики взаимодействий пользователя с книгами.
     """
@@ -1220,7 +1177,6 @@ def add_interaction_dynamics(book_genres_df:  pd.DataFrame, df: pd.DataFrame, tr
     print(f"  → Interaction dynamics features added: {len(dynamics_features.columns) - 1} new features")
     return df
 
-
 # 6. create_enhanced_features — с очисткой после каждой тяжёлой функции
 def create_enhanced_features(
     df: pd.DataFrame,
@@ -1235,6 +1191,8 @@ def create_enhanced_features(
     df = downcast_ids(df)
     train_df = df[df[constants.COL_SOURCE] == constants.VAL_SOURCE_TRAIN].copy()
 
+
+
     # Последовательность функций с gc.collect()
     df = add_temporal_features(df, train_df); gc.collect()
     df = add_interaction_feature(df, train_df); gc.collect()
@@ -1244,7 +1202,8 @@ def create_enhanced_features(
     df = add_enhanced_temporal_features(df, train_df); gc.collect()
     df = add_genre_features(df, book_genres_df); gc.collect()
     df = add_genre_preference_features(df, train_df, book_genres_df); gc.collect()
-    df = add_sequence_features(df, train_df); gc.collect()
+    df = add_simple_sequence_features(df, train_df); gc.collect()
+    df = add_rating_features(df, train_df); gc.collect()
     df = add_author_affinity_features(df, train_df); gc.collect()
     df = add_cold_start_enhancements(df, train_df); gc.collect()
     df = add_interaction_dynamics(book_genres_df, df, train_df); gc.collect()
