@@ -63,6 +63,24 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
     """
     print("Adding aggregate features...")
 
+    if constants.COL_TIMESTAMP not in train_df.columns:
+        raise ValueError(f"Timestamp column '{constants.COL_TIMESTAMP}' not found in train data.")
+    if not pd.api.types.is_datetime64_any_dtype(train_df[constants.COL_TIMESTAMP]):
+        train_df = train_df.copy()
+        train_df[constants.COL_TIMESTAMP] = pd.to_datetime(train_df[constants.COL_TIMESTAMP])
+
+    max_ts = train_df[constants.COL_TIMESTAMP].max()
+
+    def _add_prior(mean_series: pd.Series, count_series: pd.Series, prior_count: float, prior_mean: float) -> pd.Series:
+        return (mean_series * count_series + prior_mean * prior_count) / (count_series + prior_count)
+
+    def _window(df_in: pd.DataFrame, days: int) -> pd.DataFrame:
+        cutoff = max_ts - pd.Timedelta(days=days)
+        return df_in[df_in[constants.COL_TIMESTAMP] >= cutoff]
+
+    prior_mean = train_df[config.TARGET].mean()
+    prior_count = 10.0
+
     # User-based aggregates
     user_agg = train_df.groupby(constants.COL_USER_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
     user_agg.columns = [
@@ -70,6 +88,37 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
         constants.F_USER_MEAN_RATING,
         constants.F_USER_RATINGS_COUNT,
     ]
+    user_last_ts = (
+        train_df.groupby(constants.COL_USER_ID)[constants.COL_TIMESTAMP].max().reset_index()
+    )
+    user_last_ts[constants.F_USER_LAST_INTERACTION_DAYS] = (
+        (max_ts - user_last_ts[constants.COL_TIMESTAMP]).dt.total_seconds() / 86400.0
+    )
+    user_last_ts = user_last_ts.drop(columns=[constants.COL_TIMESTAMP])
+
+    # User top genre (mode by count)
+    user_top_genre = None
+    if constants.COL_GENRE_ID in train_df.columns:
+        user_top_genre = (
+            train_df.groupby(constants.COL_USER_ID)[constants.COL_GENRE_ID]
+            .agg(lambda s: s.value_counts().idxmax())
+            .reset_index()
+        )
+        user_top_genre.columns = [constants.COL_USER_ID, constants.F_USER_TOP_GENRE]
+
+    # Time-windowed user aggregates
+    user_30d = _window(train_df, 30).groupby(constants.COL_USER_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
+    user_30d.columns = [constants.COL_USER_ID, constants.F_USER_MEAN_30D, constants.F_USER_COUNT_30D]
+    user_90d = _window(train_df, 90).groupby(constants.COL_USER_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
+    user_90d.columns = [constants.COL_USER_ID, constants.F_USER_MEAN_90D, constants.F_USER_COUNT_90D]
+
+    # Apply Bayesian smoothing
+    for df_win, mean_col, count_col in [
+        (user_30d, constants.F_USER_MEAN_30D, constants.F_USER_COUNT_30D),
+        (user_90d, constants.F_USER_MEAN_90D, constants.F_USER_COUNT_90D),
+    ]:
+        if not df_win.empty:
+            df_win[mean_col] = _add_prior(df_win[mean_col], df_win[count_col], prior_count, prior_mean)
 
     # Book-based aggregates
     book_agg = train_df.groupby(constants.COL_BOOK_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
@@ -78,6 +127,48 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
         constants.F_BOOK_MEAN_RATING,
         constants.F_BOOK_RATINGS_COUNT,
     ]
+    book_last_ts = (
+        train_df.groupby(constants.COL_BOOK_ID)[constants.COL_TIMESTAMP].max().reset_index()
+    )
+    book_last_ts[constants.F_BOOK_LAST_INTERACTION_DAYS] = (
+        (max_ts - book_last_ts[constants.COL_TIMESTAMP]).dt.total_seconds() / 86400.0
+    )
+    book_last_ts = book_last_ts.drop(columns=[constants.COL_TIMESTAMP])
+
+    # Time-windowed book aggregates
+    book_30d = _window(train_df, 30).groupby(constants.COL_BOOK_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
+    book_30d.columns = [constants.COL_BOOK_ID, constants.F_BOOK_MEAN_30D, constants.F_BOOK_COUNT_30D]
+    book_90d = _window(train_df, 90).groupby(constants.COL_BOOK_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
+    book_90d.columns = [constants.COL_BOOK_ID, constants.F_BOOK_MEAN_90D, constants.F_BOOK_COUNT_90D]
+    for df_win, mean_col, count_col in [
+        (book_30d, constants.F_BOOK_MEAN_30D, constants.F_BOOK_COUNT_30D),
+        (book_90d, constants.F_BOOK_MEAN_90D, constants.F_BOOK_COUNT_90D),
+    ]:
+        if not df_win.empty:
+            df_win[mean_col] = _add_prior(df_win[mean_col], df_win[count_col], prior_count, prior_mean)
+
+    # Popularity split by relevance level
+    book_relevance = train_df.groupby(constants.COL_BOOK_ID)[config.TARGET].agg(
+        planned_rate=lambda s: (s == 1).mean(),
+        read_rate=lambda s: (s == 2).mean(),
+    ).reset_index()
+    book_relevance.columns = [
+        constants.COL_BOOK_ID,
+        constants.F_BOOK_PLANNED_RATE,
+        constants.F_BOOK_READ_RATE,
+    ]
+
+    genre_relevance = None
+    if constants.COL_GENRE_ID in train_df.columns:
+        genre_relevance = train_df.groupby(constants.COL_GENRE_ID)[config.TARGET].agg(
+            planned_rate=lambda s: (s == 1).mean(),
+            read_rate=lambda s: (s == 2).mean(),
+        ).reset_index()
+        genre_relevance.columns = [
+            constants.COL_GENRE_ID,
+            constants.F_GENRE_PLANNED_RATE,
+            constants.F_GENRE_READ_RATE,
+        ]
 
     # Author-based aggregates
     author_agg = train_df.groupby(constants.COL_AUTHOR_ID)[config.TARGET].agg(["mean"]).reset_index()
@@ -85,8 +176,70 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
 
     # Merge aggregates into the main dataframe
     df = df.merge(user_agg, on=constants.COL_USER_ID, how="left")
+    df = df.merge(user_last_ts, on=constants.COL_USER_ID, how="left")
+    if user_top_genre is not None:
+        df = df.merge(user_top_genre, on=constants.COL_USER_ID, how="left")
+
     df = df.merge(book_agg, on=constants.COL_BOOK_ID, how="left")
-    return df.merge(author_agg, on=constants.COL_AUTHOR_ID, how="left")
+    df = df.merge(book_last_ts, on=constants.COL_BOOK_ID, how="left")
+    df = df.merge(book_relevance, on=constants.COL_BOOK_ID, how="left")
+
+    if genre_relevance is not None and constants.COL_GENRE_ID in df.columns:
+        df = df.merge(genre_relevance, on=constants.COL_GENRE_ID, how="left")
+        if user_top_genre is not None:
+            df[constants.F_BOOK_MATCH_TOP_GENRE] = (
+                df[constants.COL_GENRE_ID] == df[constants.F_USER_TOP_GENRE]
+            ).astype("int8")
+    else:
+        if user_top_genre is not None:
+            df[constants.F_BOOK_MATCH_TOP_GENRE] = 0
+
+    # Merge time-windowed aggregates
+    df = df.merge(user_30d, on=constants.COL_USER_ID, how="left")
+    df = df.merge(user_90d, on=constants.COL_USER_ID, how="left")
+    df = df.merge(book_30d, on=constants.COL_BOOK_ID, how="left")
+    df = df.merge(book_90d, on=constants.COL_BOOK_ID, how="left")
+
+    # Author aggregates last to avoid chain copies
+    df = df.merge(author_agg, on=constants.COL_AUTHOR_ID, how="left")
+
+    # User-text similarity (TF-IDF)
+    tfidf_cols = [c for c in df.columns if c.startswith("tfidf_")]
+    if tfidf_cols:
+        tfidf_cols_sorted = sorted(tfidf_cols)
+        # user profiles computed on train_df to avoid leakage
+        user_profiles = (
+            train_df.groupby(constants.COL_USER_ID)[tfidf_cols_sorted].mean().astype("float32")
+        )
+        user_profiles["_norm"] = np.linalg.norm(user_profiles.values, axis=1)
+
+        # Align profiles to df rows
+        user_profile_mat = user_profiles[tfidf_cols_sorted].reindex(df[constants.COL_USER_ID]).to_numpy(dtype=np.float32)
+        user_profile_norm = user_profiles["_norm"].reindex(df[constants.COL_USER_ID]).to_numpy(dtype=np.float32) + 1e-9
+
+        cand_mat = df[tfidf_cols_sorted].to_numpy(dtype=np.float32)
+        cand_norm = np.linalg.norm(cand_mat, axis=1) + 1e-9
+        dots = np.sum(user_profile_mat * cand_mat, axis=1)
+        df[constants.F_USER_TFIDF_SIM] = dots / (user_profile_norm * cand_norm + 1e-9)
+
+    # User-text similarity (NOMIC)
+    nomic_cols = [c for c in df.columns if c.startswith("nomic_")]
+    if nomic_cols:
+        nomic_cols_sorted = sorted(nomic_cols)
+        user_profiles = (
+            train_df.groupby(constants.COL_USER_ID)[nomic_cols_sorted].mean().astype("float32")
+        )
+        user_profiles["_norm"] = np.linalg.norm(user_profiles.values, axis=1)
+
+        user_profile_mat = user_profiles[nomic_cols_sorted].reindex(df[constants.COL_USER_ID]).to_numpy(dtype=np.float32)
+        user_profile_norm = user_profiles["_norm"].reindex(df[constants.COL_USER_ID]).to_numpy(dtype=np.float32) + 1e-9
+
+        cand_mat = df[nomic_cols_sorted].to_numpy(dtype=np.float32)
+        cand_norm = np.linalg.norm(cand_mat, axis=1) + 1e-9
+        dots = np.sum(user_profile_mat * cand_mat, axis=1)
+        df[constants.F_USER_NOMIC_SIM] = dots / (user_profile_norm * cand_norm + 1e-9)
+
+    return df
 
 
 def add_genre_features(df: pd.DataFrame, book_genres_df: pd.DataFrame) -> pd.DataFrame:
@@ -100,12 +253,27 @@ def add_genre_features(df: pd.DataFrame, book_genres_df: pd.DataFrame) -> pd.Dat
         pd.DataFrame: The DataFrame with the new 'book_genres_count' column.
     """
     print("Adding genre features...")
-    genre_counts = book_genres_df.groupby(constants.COL_BOOK_ID)[constants.COL_GENRE_ID].count().reset_index()
+    genre_counts = (
+        book_genres_df.groupby(constants.COL_BOOK_ID)[constants.COL_GENRE_ID]
+        .count()
+        .reset_index()
+    )
     genre_counts.columns = [
         constants.COL_BOOK_ID,
         constants.F_BOOK_GENRES_COUNT,
     ]
-    return df.merge(genre_counts, on=constants.COL_BOOK_ID, how="left")
+
+    # Main genre per book (mode; fallback to first)
+    main_genre = (
+        book_genres_df.groupby(constants.COL_BOOK_ID)[constants.COL_GENRE_ID]
+        .agg(lambda s: s.mode().iloc[0] if not s.mode().empty else s.iloc[0])
+        .reset_index()
+    )
+    main_genre.columns = [constants.COL_BOOK_ID, constants.COL_GENRE_ID]
+
+    df = df.merge(genre_counts, on=constants.COL_BOOK_ID, how="left")
+    df = df.merge(main_genre, on=constants.COL_BOOK_ID, how="left")
+    return df
 
 
 def add_text_features(df: pd.DataFrame, train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
@@ -481,6 +649,49 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
         df[constants.F_USER_RATINGS_COUNT] = df[constants.F_USER_RATINGS_COUNT].fillna(0)
     if constants.F_BOOK_RATINGS_COUNT in df.columns:
         df[constants.F_BOOK_RATINGS_COUNT] = df[constants.F_BOOK_RATINGS_COUNT].fillna(0)
+    if constants.F_USER_LAST_INTERACTION_DAYS in df.columns:
+        df[constants.F_USER_LAST_INTERACTION_DAYS] = df[constants.F_USER_LAST_INTERACTION_DAYS].fillna(
+            constants.MISSING_NUM_VALUE
+        )
+    if constants.F_BOOK_LAST_INTERACTION_DAYS in df.columns:
+        df[constants.F_BOOK_LAST_INTERACTION_DAYS] = df[constants.F_BOOK_LAST_INTERACTION_DAYS].fillna(
+            constants.MISSING_NUM_VALUE
+        )
+    if constants.F_BOOK_PLANNED_RATE in df.columns:
+        df[constants.F_BOOK_PLANNED_RATE] = df[constants.F_BOOK_PLANNED_RATE].fillna(global_mean)
+    if constants.F_BOOK_READ_RATE in df.columns:
+        df[constants.F_BOOK_READ_RATE] = df[constants.F_BOOK_READ_RATE].fillna(global_mean)
+    for col in [
+        constants.F_USER_MEAN_30D,
+        constants.F_USER_MEAN_90D,
+        constants.F_BOOK_MEAN_30D,
+        constants.F_BOOK_MEAN_90D,
+    ]:
+        if col in df.columns:
+            df[col] = df[col].fillna(global_mean)
+    for col in [
+        constants.F_USER_COUNT_30D,
+        constants.F_USER_COUNT_90D,
+        constants.F_BOOK_COUNT_30D,
+        constants.F_BOOK_COUNT_90D,
+    ]:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+    if constants.F_GENRE_PLANNED_RATE in df.columns:
+        df[constants.F_GENRE_PLANNED_RATE] = df[constants.F_GENRE_PLANNED_RATE].fillna(global_mean)
+    if constants.F_GENRE_READ_RATE in df.columns:
+        df[constants.F_GENRE_READ_RATE] = df[constants.F_GENRE_READ_RATE].fillna(global_mean)
+    if constants.F_BOOK_MATCH_TOP_GENRE in df.columns:
+        df[constants.F_BOOK_MATCH_TOP_GENRE] = df[constants.F_BOOK_MATCH_TOP_GENRE].fillna(0).astype("int8")
+    if constants.F_USER_TOP_GENRE in df.columns:
+        df[constants.F_USER_TOP_GENRE] = df[constants.F_USER_TOP_GENRE].astype("category")
+        if constants.MISSING_CAT_VALUE not in df[constants.F_USER_TOP_GENRE].cat.categories:
+            df[constants.F_USER_TOP_GENRE] = df[constants.F_USER_TOP_GENRE].cat.add_categories([constants.MISSING_CAT_VALUE])
+        df[constants.F_USER_TOP_GENRE] = df[constants.F_USER_TOP_GENRE].fillna(constants.MISSING_CAT_VALUE)
+    if constants.F_USER_TFIDF_SIM in df.columns:
+        df[constants.F_USER_TFIDF_SIM] = df[constants.F_USER_TFIDF_SIM].fillna(0.0)
+    if constants.F_USER_NOMIC_SIM in df.columns:
+        df[constants.F_USER_NOMIC_SIM] = df[constants.F_USER_NOMIC_SIM].fillna(0.0)
 
     # Fill missing avg_rating from book_data with global mean
     df[constants.COL_AVG_RATING] = df[constants.COL_AVG_RATING].fillna(global_mean)
@@ -504,11 +715,15 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
         df[col] = df[col].fillna(0.0)
 
     # Fill remaining categorical features with a special value
-    for col in config.CAT_FEATURES:
-        if col in df.columns:
-            if df[col].dtype.name in ("category", "object") and df[col].isna().any():
-                df[col] = df[col].astype(str).fillna(constants.MISSING_CAT_VALUE).astype("category")
-            elif pd.api.types.is_numeric_dtype(df[col].dtype) and df[col].isna().any():
+    for col in config.CAT_FEATURES + [constants.COL_GENRE_ID]:
+        if col in df.columns and df[col].isna().any():
+            if df[col].dtype.name == "category":
+                if constants.MISSING_CAT_VALUE not in df[col].cat.categories:
+                    df[col] = df[col].cat.add_categories([constants.MISSING_CAT_VALUE])
+                df[col] = df[col].fillna(constants.MISSING_CAT_VALUE)
+            elif df[col].dtype.name == "object":
+                df[col] = df[col].fillna(constants.MISSING_CAT_VALUE).astype("category")
+            elif pd.api.types.is_numeric_dtype(df[col].dtype):
                 df[col] = df[col].fillna(constants.MISSING_NUM_VALUE)
 
     return df
@@ -518,7 +733,7 @@ def create_features(
     df: pd.DataFrame,
     book_genres_df: pd.DataFrame,
     descriptions_df: pd.DataFrame,
-    include_aggregates: bool = True,
+    include_aggregates: bool = False,
     include_bert: bool = False,
     include_nomic: bool = True,
 ) -> pd.DataFrame:
@@ -565,6 +780,8 @@ def create_features(
     for col in config.CAT_FEATURES:
         if col in df.columns:
             df[col] = df[col].astype("category")
+    if constants.COL_GENRE_ID in df.columns:
+        df[constants.COL_GENRE_ID] = df[constants.COL_GENRE_ID].astype("category")
 
     print("Feature engineering complete.")
     return df

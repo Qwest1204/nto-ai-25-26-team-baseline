@@ -43,6 +43,24 @@ F_BOOK_RATINGS_COUNT = "book_ratings_count"  # Will be count of interactions for
 F_AUTHOR_MEAN_RATING = "author_mean_rating"  # Will be mean(has_read) for author
 F_BOOK_GENRES_COUNT = "book_genres_count"
 F_USER_BOOK_INTERACTION = "f_user_book_interaction"  # Binary: 1 if (user_id, book_id) in train.csv, else 0
+F_USER_LAST_INTERACTION_DAYS = "user_last_interaction_days"
+F_BOOK_LAST_INTERACTION_DAYS = "book_last_interaction_days"
+F_BOOK_READ_RATE = "book_read_rate"
+F_BOOK_PLANNED_RATE = "book_planned_rate"
+F_GENRE_READ_RATE = "genre_read_rate"
+F_GENRE_PLANNED_RATE = "genre_planned_rate"
+F_USER_TOP_GENRE = "user_top_genre"
+F_BOOK_MATCH_TOP_GENRE = "book_match_top_genre"
+F_USER_MEAN_30D = "user_mean_30d"
+F_USER_MEAN_90D = "user_mean_90d"
+F_USER_COUNT_30D = "user_count_30d"
+F_USER_COUNT_90D = "user_count_90d"
+F_BOOK_MEAN_30D = "book_mean_30d"
+F_BOOK_MEAN_90D = "book_mean_90d"
+F_BOOK_COUNT_30D = "book_count_30d"
+F_BOOK_COUNT_90D = "book_count_90d"
+F_USER_TFIDF_SIM = "user_tfidf_sim"
+F_USER_NOMIC_SIM = "user_nomic_sim"
 
 # Metadata columns from raw data
 COL_GENDER = "gender"

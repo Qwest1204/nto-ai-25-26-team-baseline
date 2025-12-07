@@ -10,13 +10,54 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, precision_score, recall_score
-from catboost import CatBoostClassifier, Pool
+from catboost import CatBoostRanker, Pool
 
 from . import config, constants
-from .evaluate import dcg_at_k, ndcg_at_k
+from .evaluate import ndcg_at_k
 from .features import add_aggregate_features, handle_missing_values
 from .temporal_split import get_split_date_from_ratio, temporal_split_by_date
+
+
+def add_negative_samples(
+    train_df: pd.DataFrame,
+    base_df: pd.DataFrame,
+    n_neg: int,
+    rng: np.random.Generator,
+    max_total: int,
+) -> pd.DataFrame:
+    """Augment train_df with synthetic cold items (label=0) per user using existing books."""
+    all_books = base_df[constants.COL_BOOK_ID].unique()
+    book_templates = base_df.drop_duplicates(subset=[constants.COL_BOOK_ID]).set_index(constants.COL_BOOK_ID)
+    min_ts = base_df[constants.COL_TIMESTAMP].min()
+    ts_neg = min_ts - pd.Timedelta(seconds=1)
+
+    new_rows = []
+    total_added = 0
+    for user_id, group in train_df.groupby(constants.COL_USER_ID):
+        if total_added >= max_total:
+            break
+        user_books = set(group[constants.COL_BOOK_ID].unique())
+        candidate_books = np.setdiff1d(all_books, list(user_books))
+        if candidate_books.size == 0:
+            continue
+        k = min(n_neg, len(candidate_books), max_total - total_added)
+        sampled = rng.choice(candidate_books, size=k, replace=False)
+        for book_id in sampled:
+            tpl = book_templates.loc[book_id].copy()
+            tpl[constants.COL_USER_ID] = user_id
+            tpl[config.TARGET] = 0
+            tpl[constants.COL_SOURCE] = constants.VAL_SOURCE_TRAIN
+            tpl[constants.COL_TIMESTAMP] = ts_neg
+            new_rows.append(tpl)
+            total_added += 1
+            if total_added >= max_total:
+                break
+
+    if not new_rows:
+        return train_df
+
+    neg_df = pd.DataFrame(new_rows)
+    return pd.concat([train_df, neg_df], ignore_index=True)
 
 
 
@@ -86,15 +127,32 @@ def train() -> None:
         )
     print("✅ Temporal split validation passed: all validation timestamps are after train timestamps")
 
+    # Augment train split with synthetic cold negatives to teach ranking of cold items
+    rng = np.random.default_rng(config.RANDOM_STATE)
+    train_split_original = train_split.copy()
+    train_split = add_negative_samples(
+        train_split,
+        base_df=train_split_original,
+        n_neg=config.NEGATIVE_SAMPLES_PER_USER,
+        rng=rng,
+        max_total=config.NEGATIVE_MAX_SAMPLES,
+    )
+    if len(train_split) > len(train_split_original):
+        print(f"Added {len(train_split) - len(train_split_original):,} synthetic cold samples")
+
     # Compute aggregate features on train split only (to prevent data leakage)
     print("\nComputing aggregate features on train split only...")
-    train_split_with_agg = add_aggregate_features(train_split.copy(), train_split)
-    val_split_with_agg = add_aggregate_features(val_split.copy(), train_split)  # Use train_split for aggregates!
+    train_split_with_agg = add_aggregate_features(train_split.copy(), train_split_original)
+    val_split_with_agg = add_aggregate_features(val_split.copy(), train_split_original)  # Use original train_split for aggregates!
 
-    # Handle missing values (use train_split for fill values)
+    # Handle missing values (use original train split for fill values)
     print("Handling missing values...")
-    train_split_final = handle_missing_values(train_split_with_agg, train_split)
-    val_split_final = handle_missing_values(val_split_with_agg, train_split)
+    train_split_final = handle_missing_values(train_split_with_agg, train_split_original)
+    val_split_final = handle_missing_values(val_split_with_agg, train_split_original)
+
+    # For ranking we need grouped data; keep samples of each user together
+    train_split_final = train_split_final.sort_values(constants.COL_USER_ID).reset_index(drop=True)
+    val_split_final = val_split_final.sort_values(constants.COL_USER_ID).reset_index(drop=True)
 
     # Define features (X) and target (y)
     # Exclude timestamp, source, target, prediction columns
@@ -104,15 +162,19 @@ def train() -> None:
         constants.COL_PREDICTION,
         constants.COL_TIMESTAMP,
     ]
-    features = [col for col in train_split_final.columns if col not in exclude_cols]
+    base_features = [col for col in train_split_final.columns if col not in exclude_cols]
 
     # Exclude any remaining object columns that are not model features
-    non_feature_object_cols = train_split_final[features].select_dtypes(include=["object"]).columns.tolist()
-    features = [f for f in features if f not in non_feature_object_cols]
+    non_feature_object_cols = train_split_final[base_features].select_dtypes(include=["object"]).columns.tolist()
+    model_features = [f for f in base_features if f not in non_feature_object_cols]
+    # Drop only explicit target duplicates; keep interaction signal
+    model_features = [f for f in model_features if f not in ["has_read"]]
+    # Drop heavy raw nomic embeddings to fit GPU memory; keep similarity features
+    model_features = [f for f in model_features if not f.startswith("nomic_")]
 
-    X_train = train_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
+    X_train = train_split_final[model_features].copy()
     y_train = train_split_final[config.TARGET]
-    X_val = val_split_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1)
+    X_val = val_split_final[model_features].copy()
     y_val = val_split_final[config.TARGET]
     # Optimize memory usage: convert float64 to float32 (reduces memory by ~50%)
     print("Optimizing data types for memory efficiency...")
@@ -125,59 +187,60 @@ def train() -> None:
 
     # Identify categorical features for LightGBM
     categorical_features = [
-        f for f in features if train_split_final[f].dtype.name == "category"
+        f for f in model_features if train_split_final[f].dtype.name == "category"
     ]
     if categorical_features:
         print(f"  Categorical features: {len(categorical_features)} ({categorical_features[:5]}...)")
+        # CatBoost требует строковые категории; кастуем явно
+        for col in categorical_features:
+            X_train[col] = X_train[col].astype(str)
+            X_val[col] = X_val[col].astype(str)
 
-    print(f"Training features: {len(features)}")
+    print(f"Training features: {len(model_features)}")
     print(f"  Training data shape: {X_train.shape}, Memory: {X_train.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
 
     # Ensure model directory exists
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     # Train model
-    print("\nTraining CatBoost model (multiclass classification: 3 classes)...")
-    print("  Classes: 0=cold candidates, 1=planned books, 2=read books")
-    params = config.CATBOOST_PARAMS.copy()
-    if 'num_class' in params:
-        del params['num_class']
-    if 'objective' in params:
-        params['loss_function'] = 'MultiClass'
-    model = CatBoostClassifier(**params)
+    print("\nTraining CatBoostRanker (YetiRankPairwise)...")
+    print("  Relevance: 0=cold candidates, 1=planned books, 2=read books")
+    params = config.CATBOOST_RANKER_PARAMS.copy()
+    model = CatBoostRanker(**params)
 
-    train_pool = Pool(X_train, y_train, cat_features=categorical_features)
-    val_pool = Pool(X_val, y_val, cat_features=categorical_features)
+    # group_id is user_id for listwise ranking
+    group_id_train = train_split_final[constants.COL_USER_ID].to_numpy()
+    group_id_val = val_split_final[constants.COL_USER_ID].to_numpy()
+
+    train_pool = Pool(X_train, y_train, group_id=group_id_train, cat_features=categorical_features)
+    val_pool = Pool(X_val, y_val, group_id=group_id_val, cat_features=categorical_features)
 
     model.fit(
         train_pool,
         eval_set=val_pool,
-        early_stopping_rounds=config.EARLY_STOPPING_ROUNDS,
-        verbose=True,
+        **config.CATBOOST_RANKER_FIT_KWARGS,
     )
 
     # Evaluate the model
-    val_preds = model.predict(X_val).ravel()
-    val_proba = model.predict_proba(X_val)  # Shape: (n_samples, 3) for 3 classes
+    val_scores = model.predict(val_pool)
+    val_eval_df = pd.DataFrame(
+        {
+            constants.COL_USER_ID: val_split_final[constants.COL_USER_ID].to_numpy(),
+            "target": y_val.to_numpy(),
+            "score": val_scores,
+        }
+    )
 
-    accuracy = accuracy_score(y_val, val_preds)
-    # For multiclass, use average='weighted' or 'macro'
-    precision = precision_score(y_val, val_preds, average="weighted", zero_division=0)
-    recall = recall_score(y_val, val_preds, average="weighted", zero_division=0)
+    ndcg_k = getattr(constants, "MAX_RANKING_LENGTH", 20)
+    user_ndcg = []
+    for _, group in val_eval_df.groupby(constants.COL_USER_ID):
+        ranked = group.sort_values("score", ascending=False)
+        relevance = ranked["target"].tolist()
+        user_ndcg.append(ndcg_at_k(relevance_scores=relevance, k=ndcg_k))
 
-    # Class distribution
-    class_dist = pd.Series(val_preds).value_counts().sort_index()
-    class_proba_mean = val_proba.mean(axis=0)
-
+    mean_ndcg = float(np.mean(user_ndcg)) if user_ndcg else 0.0
     print(f"\nValidation metrics:")
-    print(f"  Accuracy: {accuracy:.4f}")
-    print(f"  Precision (weighted): {precision:.4f}")
-    print(f"  Recall (weighted): {recall:.4f}")
-    print(f"  Predicted class distribution:")
-    for class_idx in range(val_proba.shape[1]):
-        count = class_dist.get(class_idx, 0)
-        proba_mean = class_proba_mean[class_idx]
-        print(f"    Class {class_idx}: {count} samples ({100*count/len(val_preds):.1f}%), mean proba: {proba_mean:.4f}")
+    print(f"  NDCG@{ndcg_k}: {mean_ndcg:.4f}")
 
     # Save the trained model
     model_path = config.MODEL_DIR / config.MODEL_FILENAME
@@ -185,7 +248,7 @@ def train() -> None:
     print(f"Model saved → {model_path}")
 
     with open(config.MODEL_DIR / "features_list.json", "w") as f:
-        json.dump(features, f)
+        json.dump(model_features, f)
     print(f"Feature list saved → {config.MODEL_DIR / 'features_list.json'}")
 
     print("\nTraining completed successfully.")

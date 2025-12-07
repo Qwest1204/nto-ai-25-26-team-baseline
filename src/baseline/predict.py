@@ -6,10 +6,9 @@ then generates predictions using the trained model and ranks candidates for each
 """
 
 import json
-import numpy as np
 import pandas as pd
 
-from catboost import CatBoostClassifier, Pool
+from catboost import CatBoostRanker, Pool
 
 from . import config, constants
 from .data_processing import expand_candidates, load_and_merge_data
@@ -141,6 +140,7 @@ def predict() -> None:
     # Handle missing values
     print("Handling missing values...")
     candidates_final = handle_missing_values(candidates_with_agg, train_df)
+    candidates_final = candidates_final.sort_values(constants.COL_USER_ID).reset_index(drop=True)
 
     # Load feature list saved during training
     features_path = config.MODEL_DIR / "features_list.json"
@@ -240,11 +240,14 @@ def predict() -> None:
                 ).fillna(train_categories[0])
                 candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_categories, ordered=False)
 
-    X_test = candidates_final[features].copy().drop(["f_user_book_interaction", "has_read"], axis=1, errors="ignore")
+    X_test = candidates_final[features].copy()
     print(f"Prediction features: {len(X_test.columns)}")  # Updated to use X_test.columns
 
     # Identify categorical features for CatBoost, similar to training
     categorical_features = [f for f in X_test.columns if X_test[f].dtype.name == "category"]
+    # Cast categories to string for CatBoost compatibility
+    for col in categorical_features:
+        X_test[col] = X_test[col].astype(str)
 
     # Load trained model
     model_path = config.MODEL_DIR / config.MODEL_FILENAME
@@ -254,35 +257,16 @@ def predict() -> None:
         )
 
     print(f"\nLoading model from {model_path}...")
-    model = CatBoostClassifier().load_model(str(model_path))
+    model = CatBoostRanker()
+    model.load_model(str(model_path))
 
-    # Generate probabilities for multiclass (3 classes)
-    # For multiclass, model.predict_proba() returns probabilities for all classes
-    # Shape: (n_samples, 3) with [p0, p1, p2] for each sample
-    # p0 = probability of class 0 (cold candidates)
-    # p1 = probability of class 1 (planned books)
-    # p2 = probability of class 2 (read books)
-    print("Generating predictions...")
-    test_pool = Pool(X_test, cat_features=categorical_features)
-    test_proba_all = model.predict_proba(test_pool)  # Returns probabilities for all classes
-    # Convert to numpy array if needed and ensure it's 2D array: (n_samples, num_classes)
-    test_proba_all = np.array(test_proba_all)
-    if test_proba_all.ndim == 1:
-        # If it's 1D, reshape to (n_samples, num_classes)
-        test_proba_all = test_proba_all.reshape(-1, test_proba_all.shape[0] // X_test.shape[0])
-
-    # Calculate ranking score adaptively based on number of classes
-    num_classes = test_proba_all.shape[1]
-    if num_classes == 3:
-        test_proba = test_proba_all[:, 1] * 1.0 + test_proba_all[:, 2] * 2.0
-    elif num_classes == 2:
-        # Assume classes 0 and 1 (cold and planned), ignore read
-        test_proba = test_proba_all[:, 1] * 1.0
-    else:
-        raise ValueError(f"Unexpected number of classes: {num_classes}")
+    print("Generating predictions (ranking scores)...")
+    group_id_test = candidates_final[constants.COL_USER_ID].to_numpy()
+    test_pool = Pool(X_test, group_id=group_id_test, cat_features=categorical_features)
+    test_scores = model.predict(test_pool).ravel()
 
     # Add predictions to candidates dataframe
-    candidates_final["prediction"] = test_proba
+    candidates_final["prediction"] = test_scores
 
     # Rank candidates for each user and select top-K
     print("\nRanking candidates for each user...")
