@@ -127,6 +127,7 @@ def train_2stage():
             'eval_metric': 'NDCG:top=20',
             'random_seed': 42,
             'verbose': 200,
+            'task_type': 'GPU',  # Enable GPU
         }
         model = CatBoostRanker(**params)
         model.fit(cb_pool_train, eval_set=cb_pool_val, early_stopping_rounds=100)
@@ -155,6 +156,7 @@ def train_2stage():
         eval_metric='NDCG:top=20',
         random_seed=42,
         verbose=200,
+        task_type='GPU',  # Enable GPU
     )
     cb_model.fit(cb_pool_train, eval_set=cb_pool_val, early_stopping_rounds=100)
     score1_train = cb_model.predict(cb_pool_train)
