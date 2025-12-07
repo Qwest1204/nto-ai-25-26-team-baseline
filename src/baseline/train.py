@@ -215,13 +215,20 @@ def train_2stage():
             'metric': 'ndcg',
             'ndcg_at': [20],
             'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-            'num_leaves': trial.suggest_int('num_leaves', 31, 256),
-            'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 20, 100),
-            'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 1.0),
-            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 1.0),
-            'bagging_freq': 5,
+            'num_leaves': trial.suggest_int('num_leaves', 31, 512),  # можно больше
+            'max_depth': trial.suggest_int('max_depth', -1, 15),  # добавляем ограничение глубины
+            'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 10, 300),
+            'min_sum_hessian_in_leaf': 1e-3,
+            'feature_fraction': trial.suggest_float('feature_fraction', 0.5, 1.0),
+            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.5, 1.0),
+            'bagging_freq': trial.suggest_int('bagging_freq', 1, 10),
+            'lambda_l1': trial.suggest_float('lambda_l1', 0.0, 10.0, log=True),
+            'lambda_l2': trial.suggest_float('lambda_l2', 0.0, 50.0, log=True),
             'verbose': -1,
-            'lambda_l2': trial.suggest_float('lambda_l2', 0.1, 10, log=True),
+            'force_row_wise': True,
+
+            # САМОЕ ГЛАВНОЕ:
+            'feature_pre_filter': False,
         }
         model = lgb.train(
             params,
