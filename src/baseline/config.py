@@ -39,8 +39,14 @@ MODEL_FILENAME_PATTERN = "lgb_fold_{fold}.txt"  # Deprecated: kept for backwards
 MODEL_FILENAME = "catboost_ranker.cbm"  # Single model filename for temporal split
 
 # --- NEGATIVE SAMPLING ---
-NEGATIVE_SAMPLES_PER_USER = 2
-NEGATIVE_MAX_SAMPLES = 40000
+NEGATIVE_SAMPLES_PER_USER = 1
+NEGATIVE_MAX_SAMPLES = 20000
+
+# --- CATEGORY BUCKETING ---
+RARE_CATEGORY_MIN_COUNT = 20
+
+# --- NOMIC DIM REDUCTION ---
+NOMIC_SVD_DIM = 128
 
 # --- TF-IDF PARAMETERS ---
 TFIDF_MAX_FEATURES = 100 #УМЕНЬШИЛ Т К НЕ ТЯНЕТ!
@@ -64,6 +70,7 @@ NOMIC_MAX_LENGTH = 8192
 NOMIC_EMBEDDING_DIM = 768
 NOMIC_DEVICE = "cuda" if torch and torch.cuda.is_available() else "cpu"
 NOMIC_GPU_MEMORY_FRACTION = 0.75
+NOMIC_SVD_DIM = 64
 
 
 # --- FEATURES ---
@@ -103,7 +110,7 @@ CATBOOST_PARAMS = {
 CATBOOST_RANKER_PARAMS = {
     "loss_function": "YetiRankPairwise",
     "eval_metric": EVAL_METRIC_RANK,
-    "iterations": 1200,
+    "iterations": 800,
     "learning_rate": 0.07,
     "depth": 6,
     "min_data_in_leaf": 32,
@@ -111,22 +118,22 @@ CATBOOST_RANKER_PARAMS = {
     "random_strength": 1.0,
     "bootstrap_type": "Bernoulli",
     "subsample": 0.7,
-    "rsm": 0.8,
-    "one_hot_max_size": 8,
+    "rsm": 0.7,
+    "one_hot_max_size": 1,  # CPU pairwise requires no one-hot
     "max_ctr_complexity": 1,
-    "max_bin": 128,
+    "max_bin": 96,
     "random_seed": RANDOM_STATE,
     "thread_count": -1,
-    "task_type": "GPU" if torch and torch.cuda.is_available() else "CPU",
-    "devices": "0" if torch and torch.cuda.is_available() else None,
+    "task_type": "CPU",
+    "devices": None,
     "od_type": "Iter",
     "od_wait": EARLY_STOPPING_ROUNDS,
-    "metric_period": 50,
+    "metric_period": 100,
 }
 
 # тренировка
 CATBOOST_RANKER_FIT_KWARGS = {
     "use_best_model": True,
-    "verbose": 50,
+    "verbose": 100,
     "plot": False,
 }

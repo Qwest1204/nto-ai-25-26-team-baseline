@@ -61,6 +61,13 @@ F_BOOK_COUNT_30D = "book_count_30d"
 F_BOOK_COUNT_90D = "book_count_90d"
 F_USER_TFIDF_SIM = "user_tfidf_sim"
 F_USER_NOMIC_SIM = "user_nomic_sim"
+F_USER_RATINGS_COUNT_LOG = "user_ratings_count_log"
+F_BOOK_RATINGS_COUNT_LOG = "book_ratings_count_log"
+F_BOOK_GENRES_COUNT_LOG = "book_genres_count_log"
+F_USER_COUNT_30D_LOG = "user_count_30d_log"
+F_USER_COUNT_90D_LOG = "user_count_90d_log"
+F_BOOK_COUNT_30D_LOG = "book_count_30d_log"
+F_BOOK_COUNT_90D_LOG = "book_count_90d_log"
 
 # Metadata columns from raw data
 COL_GENDER = "gender"

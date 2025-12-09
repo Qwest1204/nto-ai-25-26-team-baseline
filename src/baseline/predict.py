@@ -135,6 +135,13 @@ def predict() -> None:
 
     # Compute aggregate features on ALL train data
     print("\nComputing aggregate features on all train data...")
+    # Align dtypes for categorical keys to avoid merge errors
+    cat_key_cols = [constants.COL_AUTHOR_ID, constants.COL_PUBLISHER, constants.COL_LANGUAGE]
+    for col in cat_key_cols:
+        if col in candidates_with_meta.columns:
+            candidates_with_meta[col] = candidates_with_meta[col].astype(str)
+        if col in train_df.columns:
+            train_df[col] = train_df[col].astype(str)
     candidates_with_agg = add_aggregate_features(candidates_with_meta.copy(), train_df)
 
     # Handle missing values

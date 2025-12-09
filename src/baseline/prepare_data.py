@@ -44,6 +44,11 @@ def prepare_data() -> None:
     # Define the output path
     processed_path = config.PROCESSED_DATA_DIR / constants.PROCESSED_DATA_FILENAME
 
+    # Cast rare-bucketed categoricals to string to avoid Arrow int conversion issues
+    for col in [constants.COL_AUTHOR_ID, constants.COL_PUBLISHER, constants.COL_LANGUAGE]:
+        if col in featured_df.columns:
+            featured_df[col] = featured_df[col].astype(str)
+
     # Save processed data as parquet for efficiency
     print(f"\nSaving processed data to {processed_path}...")
     featured_df.to_parquet(processed_path, index=False, engine="pyarrow", compression="snappy")

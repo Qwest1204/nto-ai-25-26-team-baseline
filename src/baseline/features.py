@@ -8,6 +8,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
@@ -210,7 +211,7 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
         # user profiles computed on train_df to avoid leakage
         user_profiles = (
             train_df.groupby(constants.COL_USER_ID)[tfidf_cols_sorted].mean().astype("float32")
-        )
+        ).copy()
         user_profiles["_norm"] = np.linalg.norm(user_profiles.values, axis=1)
 
         # Align profiles to df rows
@@ -228,7 +229,7 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
         nomic_cols_sorted = sorted(nomic_cols)
         user_profiles = (
             train_df.groupby(constants.COL_USER_ID)[nomic_cols_sorted].mean().astype("float32")
-        )
+        ).copy()
         user_profiles["_norm"] = np.linalg.norm(user_profiles.values, axis=1)
 
         user_profile_mat = user_profiles[nomic_cols_sorted].reindex(df[constants.COL_USER_ID]).to_numpy(dtype=np.float32)
@@ -606,10 +607,20 @@ def add_nomic_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_d
     nomic_feature_names = [f"nomic_{i}" for i in range(config.NOMIC_EMBEDDING_DIM)]
     nomic_df = pd.DataFrame(embeddings_array, columns=nomic_feature_names, index=df.index)
 
-    # Concatenate NOMIC features with main DataFrame
-    df_with_nomic = pd.concat([df.reset_index(drop=True), nomic_df.reset_index(drop=True)], axis=1)
+    # Dimensionality reduction for NOMIC
+    svd_dim = min(config.NOMIC_SVD_DIM, config.NOMIC_EMBEDDING_DIM)
+    svd = TruncatedSVD(n_components=svd_dim, random_state=config.RANDOM_STATE)
+    nomic_svd = svd.fit_transform(embeddings_array)
+    nomic_svd_names = [f"nomic_svd_{i}" for i in range(svd_dim)]
+    nomic_svd_df = pd.DataFrame(nomic_svd, columns=nomic_svd_names, index=df.index)
 
-    print(f"Added {len(nomic_feature_names)} NOMIC features.")
+    # Concatenate NOMIC features with main DataFrame
+    df_with_nomic = pd.concat(
+        [df.reset_index(drop=True), nomic_df.reset_index(drop=True), nomic_svd_df.reset_index(drop=True)],
+        axis=1,
+    )
+
+    print(f"Added {len(nomic_feature_names)} NOMIC features and {svd_dim} SVD components.")
     return df_with_nomic
 
 
@@ -628,6 +639,9 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
         pd.DataFrame: The DataFrame with missing values handled.
     """
     print("Handling missing values...")
+
+    # Make a fresh copy to reduce fragmentation
+    df = df.copy()
 
     # Calculate global mean from training data for filling
     # For has_read, this is the proportion of read books
@@ -693,6 +707,27 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
     if constants.F_USER_NOMIC_SIM in df.columns:
         df[constants.F_USER_NOMIC_SIM] = df[constants.F_USER_NOMIC_SIM].fillna(0.0)
 
+    # Bucket rare categories for selected high-cardinality columns based on train_df frequencies
+    rare_cols = [constants.COL_AUTHOR_ID, constants.COL_PUBLISHER, constants.COL_LANGUAGE]
+    for col in rare_cols:
+        if col in df.columns and col in train_df.columns:
+            vc = train_df[col].value_counts()
+            rare_values = set(vc[vc < config.RARE_CATEGORY_MIN_COUNT].index)
+            if rare_values:
+                # Add missing category to both df and train_df if categorical
+                if df[col].dtype.name == "category":
+                    if constants.MISSING_CAT_VALUE not in df[col].cat.categories:
+                        df[col] = df[col].cat.add_categories([constants.MISSING_CAT_VALUE])
+                if train_df[col].dtype.name == "category":
+                    if constants.MISSING_CAT_VALUE not in train_df[col].cat.categories:
+                        train_df[col] = train_df[col].cat.add_categories([constants.MISSING_CAT_VALUE])
+                # Cast to object to safely replace and avoid category validation issues
+                df[col] = df[col].astype("object").where(~df[col].isin(rare_values), other=constants.MISSING_CAT_VALUE)
+                train_df[col] = train_df[col].astype("object").where(~train_df[col].isin(rare_values), other=constants.MISSING_CAT_VALUE)
+                # Restore to category
+                df[col] = df[col].astype("category")
+                train_df[col] = train_df[col].astype("category")
+
     # Fill missing avg_rating from book_data with global mean
     df[constants.COL_AVG_RATING] = df[constants.COL_AVG_RATING].fillna(global_mean)
 
@@ -725,6 +760,23 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
                 df[col] = df[col].fillna(constants.MISSING_CAT_VALUE).astype("category")
             elif pd.api.types.is_numeric_dtype(df[col].dtype):
                 df[col] = df[col].fillna(constants.MISSING_NUM_VALUE)
+
+    # Log-transforms for skewed counts
+    log_map = {
+        constants.F_USER_RATINGS_COUNT: constants.F_USER_RATINGS_COUNT_LOG,
+        constants.F_BOOK_RATINGS_COUNT: constants.F_BOOK_RATINGS_COUNT_LOG,
+        constants.F_BOOK_GENRES_COUNT: constants.F_BOOK_GENRES_COUNT_LOG,
+        constants.F_USER_COUNT_30D: constants.F_USER_COUNT_30D_LOG,
+        constants.F_USER_COUNT_90D: constants.F_USER_COUNT_90D_LOG,
+        constants.F_BOOK_COUNT_30D: constants.F_BOOK_COUNT_30D_LOG,
+        constants.F_BOOK_COUNT_90D: constants.F_BOOK_COUNT_90D_LOG,
+    }
+    log_feats = {}
+    for src, dst in log_map.items():
+        if src in df.columns:
+            log_feats[dst] = np.log1p(df[src].astype(float))
+    if log_feats:
+        df = df.assign(**log_feats)
 
     return df
 
